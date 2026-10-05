@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+chromadb
+google-generativeai
+pydantic

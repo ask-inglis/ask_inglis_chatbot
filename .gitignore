@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment variables / secrets
+.env
+
+# Chroma local database
+chroma_store/
+
+# OS files
+.DS_Store
