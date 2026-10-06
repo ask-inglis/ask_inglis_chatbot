@@ -1,5 +1,8 @@
 fastapi
 uvicorn[standard]
 chromadb
-google-generativeai
+google-genai
 pydantic
+python-docx
+PyGithub
+python-dotenv
