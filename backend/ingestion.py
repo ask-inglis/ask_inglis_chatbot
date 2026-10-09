@@ -1,11 +1,18 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
+import io
+import sys
+import base64
 import hashlib
 import chromadb
 from chromadb.utils import embedding_functions
 from docx import Document
-from github import Github
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from github import Github, Auth
 
-NOTES_FOLDER = "./data/notes"
 CHUNK_SIZE = 300
 
 chroma_client = chromadb.PersistentClient(path="./chroma_store")
@@ -16,42 +23,75 @@ collection = chroma_client.get_or_create_collection(
 )
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")
-GITHUB_NOTES_PATH = "data/notes"
+GITHUB_NOTES_REPO = os.environ.get("GITHUB_NOTES_REPO")
+GITHUB_NOTES_PATH = "data/notes"  # path inside the private notes repo, not on disk
 
 _github_client = None
 
 
+# ---------- Private notes repo ----------
+
 def get_github_repo():
     global _github_client
-    if not GITHUB_TOKEN or not GITHUB_REPO:
+    if not GITHUB_TOKEN or not GITHUB_NOTES_REPO:
         return None
-    if _github_client is None:
-        _github_client = Github(GITHUB_TOKEN)
-    return _github_client.get_repo(GITHUB_REPO)
+    try:
+        if _github_client is None:
+            _github_client = Github(auth=Auth.Token(GITHUB_TOKEN))
+        return _github_client.get_repo(GITHUB_NOTES_REPO)
+    except Exception as e:
+        print(f"Could not open GitHub repo '{GITHUB_NOTES_REPO}': {e}")
+        return None
 
 
 def push_to_github(filename: str, text: str):
+    """Save a note as .txt in the private repo. Failures are logged, never raised."""
+    repo = get_github_repo()
+    if repo is None:
+        print(f"WARNING: GitHub not configured, '{filename}' was NOT backed up")
+        return
+
+    path = f"{GITHUB_NOTES_PATH}/{filename}.txt"
+    try:
+        try:
+            existing = repo.get_contents(path)
+        except Exception:
+            repo.create_file(path=path, message=f"Add note: {filename}", content=text)
+            return
+        repo.update_file(
+            path=path,
+            message=f"Update note: {filename}",
+            content=text,
+            sha=existing.sha,
+        )
+    except Exception as e:
+        print(f"GitHub backup failed for {filename}: {e}")
+
+
+def delete_from_github(filename: str):
     repo = get_github_repo()
     if repo is None:
         return
-
-    github_path = f"{GITHUB_NOTES_PATH}/{filename}.txt"
+    path = f"{GITHUB_NOTES_PATH}/{filename}.txt"
     try:
-        existing_file = repo.get_contents(github_path)
-        repo.update_file(
-            path=github_path,
-            message=f"Update note: {filename}",
-            content=text,
-            sha=existing_file.sha,
-        )
-    except Exception:
-        repo.create_file(
-            path=github_path,
-            message=f"Add note: {filename}",
-            content=text,
-        )
+        f = repo.get_contents(path)
+        repo.delete_file(path, f"Delete note: {filename}", f.sha)
+    except Exception as e:
+        print(f"GitHub delete failed for {filename}: {e}")
 
+
+def read_note_from_github(filename: str) -> str | None:
+    repo = get_github_repo()
+    if repo is None:
+        return None
+    try:
+        f = repo.get_contents(f"{GITHUB_NOTES_PATH}/{filename}.txt")
+        return f.decoded_content.decode("utf-8")
+    except Exception:
+        return None
+
+
+# ---------- Chunking and ingestion ----------
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
     words = text.split()
@@ -69,6 +109,7 @@ def remove_existing_chunks(source_filename: str):
 
 
 def ingest_text(filename: str, text: str, force: bool = False, save_backup: bool = True) -> dict:
+    """Chunk and store a note in ChromaDB, and back it up to the private repo."""
     current_hash = text_hash(text)
 
     existing = collection.get(where={"source": filename}, limit=1)
@@ -84,64 +125,92 @@ def ingest_text(filename: str, text: str, force: bool = False, save_backup: bool
     remove_existing_chunks(filename)
 
     chunks = chunk_text(text)
-    for i, chunk in enumerate(chunks):
+    if chunks:
         collection.add(
-            documents=[chunk],
-            metadatas=[{"source": filename, "content_hash": current_hash, "chunk_index": i}],
-            ids=[f"{filename}_{i}"],
+            documents=chunks,
+            metadatas=[
+                {"source": filename, "content_hash": current_hash, "chunk_index": i}
+                for i in range(len(chunks))
+            ],
+            ids=[f"{filename}_{i}" for i in range(len(chunks))],
         )
 
     if save_backup:
-        os.makedirs(NOTES_FOLDER, exist_ok=True)
-        local_path = os.path.join(NOTES_FOLDER, f"{filename}.txt")
-        with open(local_path, "w") as f:
-            f.write(text)
         push_to_github(filename, text)
 
     return {"status": "ingested", "filename": filename, "chunks": len(chunks)}
 
 
+# ---------- Startup rebuild (reads only from the private repo) ----------
+
 def rebuild_from_backups():
-    if not os.path.exists(NOTES_FOLDER):
-        return []
-
+    """Run on startup. Rebuilds ChromaDB from the .txt notes in the private repo."""
+    repo = get_github_repo()
+    print(f"GitHub repo: {GITHUB_NOTES_REPO!r}, token set: {bool(GITHUB_TOKEN)}, repo opened: {repo is not None}")
     results = []
-    for filename in os.listdir(NOTES_FOLDER):
-        if not filename.endswith(".txt"):
-            continue
-        filepath = os.path.join(NOTES_FOLDER, filename)
-        with open(filepath, "r") as f:
-            text = f.read()
-        original_name = filename.replace(".txt", "")
-        result = ingest_text(original_name, text, force=True, save_backup=False)
-        results.append(result)
 
+    if repo is None:
+        print("WARNING: notes repo not available, skipping rebuild")
+        return results
+
+    try:
+        files = repo.get_contents(GITHUB_NOTES_PATH)
+    except Exception as e:
+        print(f"Could not read notes from GitHub: {e}")
+        return results
+
+    for f in files:
+        if not f.name.endswith(".txt"):
+            continue
+        text = f.decoded_content.decode("utf-8")
+        results.append(ingest_text(f.name[:-4], text, save_backup=False))
     return results
 
 
-def read_docx(path: str) -> str:
-    doc = Document(path)
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+# ---------- One-time seeding from the Word files in the private repo ----------
+
+def read_docx_bytes(data: bytes) -> str:
+    """Extract text from a .docx, keeping paragraphs and table rows in order."""
+    doc = Document(io.BytesIO(data))
+    parts = []
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith("}p"):
+            t = Paragraph(child, doc).text.strip()
+            if t:
+                parts.append(t)
+        elif child.tag.endswith("}tbl"):
+            for row in Table(child, doc).rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+    return "\n".join(parts)
 
 
-def ingest_local_docx_folder(force: bool = False) -> list[dict]:
+def seed_from_repo_docx(force: bool = False) -> list[dict]:
+    """Read .docx files from the private repo, extract text, ingest it, and save
+    a .txt copy back to the same repo. Nothing is written to local disk."""
+    repo = get_github_repo()
+    if repo is None:
+        print("GitHub not configured")
+        return []
+
     results = []
-    if not os.path.exists(NOTES_FOLDER):
-        os.makedirs(NOTES_FOLDER)
-        return results
-
-    for filename in os.listdir(NOTES_FOLDER):
-        if not filename.endswith(".docx"):
+    for f in repo.get_contents(GITHUB_NOTES_PATH):
+        if f.name.endswith(".doc"):
+            print(f"SKIPPED (old .doc format, convert to .docx): {f.name}")
             continue
-        filepath = os.path.join(NOTES_FOLDER, filename)
-        text = read_docx(filepath)
-        result = ingest_text(filename, text, force=force)
+        if not f.name.endswith(".docx"):
+            continue
+        blob = repo.get_git_blob(f.sha)  # works for files over 1 MB
+        text = read_docx_bytes(base64.b64decode(blob.content))
+        result = ingest_text(f.name[:-5], text, force=force)
+        print(result)
         results.append(result)
-
     return results
 
 
 if __name__ == "__main__":
-    results = ingest_local_docx_folder()
-    for r in results:
-        print(r)
+    seed_from_repo_docx()
+    print("Done.")
+    sys.stdout.flush()
+    os._exit(0)  # skips the native-library shutdown crash
