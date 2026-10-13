@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 chromadb
 google-genai
+openai
 pydantic
 python-docx
 PyGithub

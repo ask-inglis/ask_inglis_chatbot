@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
+from openai import OpenAI
 
 from ingestion import (
     ingest_text,
@@ -26,16 +27,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- LLM setup ----------
+
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.5-flash-lite")
-client = genai.Client(api_key=GEMINI_API_KEY)
+
+BULLSAI_API_KEY = os.environ.get("BULLSAI_API_KEY")
+BULLSAI_BASE_URL = os.environ.get("BULLSAI_BASE_URL", "https://gateway.bullsai.buffalo.edu/v1")
+BULLSAI_MODEL_NAME = os.environ.get("BULLSAI_MODEL_NAME", "zai-org/GLM-5.3-Flash")
+
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+bullsai_client = (
+    OpenAI(api_key=BULLSAI_API_KEY, base_url=BULLSAI_BASE_URL, timeout=60)
+    if BULLSAI_API_KEY
+    else None
+)
+
+if LLM_PROVIDER == "bullsai" and bullsai_client is None:
+    raise RuntimeError("LLM_PROVIDER is 'bullsai' but BULLSAI_API_KEY is not set")
+if LLM_PROVIDER == "gemini" and gemini_client is None:
+    raise RuntimeError("LLM_PROVIDER is 'gemini' but GEMINI_API_KEY is not set")
+if LLM_PROVIDER not in ("bullsai", "gemini"):
+    raise RuntimeError(f"Unknown LLM_PROVIDER '{LLM_PROVIDER}' (use 'bullsai' or 'gemini')")
+
+print(
+    f"LLM provider: {LLM_PROVIDER}, model: "
+    f"{BULLSAI_MODEL_NAME if LLM_PROVIDER == 'bullsai' else GEMINI_MODEL_NAME}"
+)
 
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 
 
 def generate(prompt: str) -> str:
-    """The only place the app calls Gemini, so a future model or SDK change is one edit."""
-    response = client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
+    """The only place the app calls an LLM. Which one is set by LLM_PROVIDER."""
+    if LLM_PROVIDER == "bullsai":
+        response = bullsai_client.chat.completions.create(
+            model=BULLSAI_MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    response = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
     return (response.text or "").strip()
 
 
@@ -171,7 +205,7 @@ Answer:"""
     try:
         reply = generate(prompt)
     except Exception as e:
-        print(f"Gemini call failed: {e}")
+        print(f"LLM call failed: {e}")
         raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
 
     if not reply:
