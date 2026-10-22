@@ -3,6 +3,7 @@ uvicorn[standard]
 chromadb
 google-genai
 openai
+httpx
 pydantic
 python-docx
 PyGithub
