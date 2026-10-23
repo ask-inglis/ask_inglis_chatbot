@@ -8,3 +8,4 @@ pydantic
 python-docx
 PyGithub
 python-dotenv
+pypdf
