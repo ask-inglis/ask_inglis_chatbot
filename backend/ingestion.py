@@ -14,6 +14,7 @@ from docx.text.paragraph import Paragraph
 from github import Github, Auth
 
 CHUNK_SIZE = 300
+CHUNK_OVERLAP = 60  # each chunk repeats the last 60 words of the previous one
 
 chroma_client = chromadb.PersistentClient(path="./chroma_store")
 embedding_fn = embedding_functions.DefaultEmbeddingFunction()
@@ -93,9 +94,19 @@ def read_note_from_github(filename: str) -> str | None:
 
 # ---------- Chunking and ingestion ----------
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split text into chunks of about `chunk_size` words. Neighbouring chunks share `overlap`
+    words, so a sentence at a boundary is never cut off from its context."""
     words = text.split()
-    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    if not words:
+        return []
+    step = max(chunk_size - overlap, 1)
+    chunks = []
+    for start in range(0, len(words), step):
+        chunks.append(" ".join(words[start:start + chunk_size]))
+        if start + chunk_size >= len(words):
+            break
+    return chunks
 
 
 def text_hash(text: str) -> str:
@@ -194,18 +205,38 @@ def seed_from_repo_docx(force: bool = False) -> list[dict]:
         print("GitHub not configured")
         return []
 
+    try:
+        files = repo.get_contents(GITHUB_NOTES_PATH)
+    except Exception as e:
+        print(f"Could not list '{GITHUB_NOTES_PATH}' in {GITHUB_NOTES_REPO}: {e}")
+        try:
+            print("Top level of the repo:", [c.path for c in repo.get_contents("")])
+        except Exception as e2:
+            print(f"Could not even list the repo root: {e2} (check token access)")
+        return []
+
     results = []
-    for f in repo.get_contents(GITHUB_NOTES_PATH):
+    failed = []
+    for f in files:
         if f.name.endswith(".doc"):
             print(f"SKIPPED (old .doc format, convert to .docx): {f.name}")
             continue
         if not f.name.endswith(".docx"):
             continue
-        blob = repo.get_git_blob(f.sha)  # works for files over 1 MB
-        text = read_docx_bytes(base64.b64decode(blob.content))
-        result = ingest_text(f.name[:-5], text, force=force)
-        print(result)
-        results.append(result)
+        try:
+            blob = repo.get_git_blob(f.sha)  # works for files over 1 MB
+            text = read_docx_bytes(base64.b64decode(blob.content))
+            result = ingest_text(f.name[:-5], text, force=force)
+            print(result)
+            results.append(result)
+        except Exception as e:
+            print(f"FAILED: {f.name} -> {e}")
+            failed.append(f.name)
+
+    if failed:
+        print("\nThese files could not be read. Re-save each one in Word as .docx:")
+        for name in failed:
+            print(f"  - {name}")
     return results
 
 
