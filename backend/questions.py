@@ -69,7 +69,7 @@ def validate_item(item: dict, n_options: int = OPTIONS_PER_QUESTION) -> list[str
     lens = {k: len(v) for k, v in options.items()}
     others = sorted(l for k, l in lens.items() if k != answer)
     median = others[len(others) // 2]
-    if lens[answer] == max(lens.values()) and lens[answer] > 1.5 * max(median, 1):
+    if lens[answer] == max(lens.values()) and lens[answer] > 1.15 * max(median, 1):
         problems.append("the correct answer is noticeably the longest option")
     if max(lens.values()) > 3 * max(min(lens.values()), 1):
         problems.append("options differ a lot in length")
@@ -225,6 +225,77 @@ def format_markdown(items: list[dict]) -> str:
         lines.append(f"- **{i}. {q['answer']}**: {q['explanation']}{source}")
     return "\n".join(lines)
 
+SHOW_ANSWERS = re.compile(
+    r"\b(show|reveal|give|see|tell|what\s+(?:are|is))\b[^.?!]{0,25}\b(?:answers?|answer\s+key|solutions?)\b"
+    r"|^\W*(?:the\s+)?(?:answers?|answer\s+key|solutions?)(?:\s+please)?\W*$",
+    re.IGNORECASE,
+)
+PICK = re.compile(r"\b(\d{1,2})\s*[.):=\-]?\s*([A-Ea-e])\b")
+
+
+def wants_answers(message: str) -> bool:
+    return len(message.split()) <= 12 and bool(SHOW_ANSWERS.search(message))
+
+
+def parse_picks(message: str, n: int) -> dict[int, str] | None:
+    """Read a student's answers: '1B 2D 3A', '1. B, 2. D', 'B D A E C' or 'BDAEC'.
+    Returns {question number: letter}, or None if the message isn't a list of answers."""
+    if len(message.split()) > 40:
+        return None
+    pairs = PICK.findall(message)
+    if pairs:
+        leftover = PICK.sub(" ", message)
+        if len(re.findall(r"[A-Za-z]{2,}", leftover)) > 4:
+            return None
+        picks = {int(num): letter.upper() for num, letter in pairs if 1 <= int(num) <= n}
+        return picks or None
+    letters = re.findall(r"[A-Za-z]+", message)
+    if len(letters) == n and all(len(t) == 1 and t.upper() in LETTERS for t in letters):
+        return {i: t.upper() for i, t in enumerate(letters, 1)}
+    compact = re.fullmatch(r"\W*([A-E]{2,})\W*", message)  # uppercase only, so words like "bad" don't count
+    if compact and len(compact.group(1)) == n:
+        return {i: c for i, c in enumerate(compact.group(1), 1)}
+    return None
+
+
+def format_quiz(items: list[dict]) -> str:
+    """The questions only, with no answers."""
+    if not items:
+        return format_markdown([])
+    lines = []
+    for i, q in enumerate(items, 1):
+        lines.append(f"**Question {i}.** {q['stem']}\n")
+        for letter in sorted(q["options"]):
+            lines.append(f"{letter}. {q['options'][letter]}  ")
+        lines.append("")
+    lines.append('Reply with your answers (for example "1B 2D 3A"), or say "show answers".')
+    return "\n".join(lines)
+
+
+def format_answer_key(items: list[dict]) -> str:
+    lines = ["**Answers**\n"]
+    for i, q in enumerate(items, 1):
+        source = f" *({q['lecture']})*" if q["lecture"] else ""
+        lines.append(f"- **{i}. {q['answer']}**: {q['explanation']}{source}")
+    return "\n".join(lines)
+
+
+def grade_answers(items: list[dict], picks: dict[int, str]) -> str:
+    right, lines = 0, []
+    for i, q in enumerate(items, 1):
+        chosen = picks.get(i)
+        source = f" *({q['lecture']})*" if q["lecture"] else ""
+        if chosen == q["answer"]:
+            right += 1
+            lines.append(f"- **{i}. Correct** ({q['answer']}).")
+        elif chosen:
+            lines.append(
+                f"- **{i}. Not quite.** You chose {chosen}; the answer is **{q['answer']}**. "
+                f"{q['explanation']}{source}"
+            )
+        else:
+            lines.append(f"- **{i}. Not answered.** The answer is **{q['answer']}**. {q['explanation']}{source}")
+    return f"**Score: {right} of {len(items)}**\n\n" + "\n".join(lines)
 
 def save_batch(topic: str, items: list[dict]) -> str | None:
     """Save a generated batch to questions/generated/ in the private repo, to build up a question bank."""

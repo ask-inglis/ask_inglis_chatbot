@@ -45,10 +45,21 @@ from review import (
     dispute_record,
     remember_answer,
     recall_lectures,
+    remember_quiz,
+    find_quiz,
     DISPUTE_REPLY,
 )
 from guides import rebuild_guides
-from questions import parse_quiz_request, generate_questions, format_markdown, save_batch
+from questions import (
+    parse_quiz_request,
+    generate_questions,
+    format_quiz,
+    format_answer_key,
+    grade_answers,
+    parse_picks,
+    wants_answers,
+    save_batch,
+)
 from protect import allowed_origins, rate_limit, daily_cap
 from cache import cache_get, cache_put, cache_clear
 
@@ -91,7 +102,7 @@ CUSTOM_LLM_MAX_TOKENS = int(os.environ.get("CUSTOM_LLM_MAX_TOKENS", "1500"))
 MAX_IMAGE_DISTANCE = float(os.environ.get("MAX_IMAGE_DISTANCE", "1.0"))
 IMAGES_IN_REPLY = os.environ.get("IMAGES_IN_REPLY", "true").lower() == "true"
 DISPUTE_IN_CHAT = os.environ.get("DISPUTE_IN_CHAT", "true").lower() == "true"
-QUIZ_IN_CHAT = os.environ.get("QUIZ_IN_CHAT", "true").lower() == "true"
+QUIZ_IN_CHAT = os.environ.get("QUIZ_IN_CHAT", "false").lower() == "true"
 
 # Only rewrite follow-ups shorter than this many words; longer ones usually stand alone
 REWRITE_BELOW_WORDS = 12
@@ -383,6 +394,33 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 dispute_record(question, answer, request.message, recall_lectures(answer)),
             )
             return ChatResponse(reply=DISPUTE_REPLY, sources=[], lectures=[])
+    
+    # Follow-ups to a practice quiz: "show answers" or "1B 2D 3A". No AI call, never cached.
+    if QUIZ_IN_CHAT and request.history:
+        items, seen_quiz = find_quiz(request.history)
+        asking = wants_answers(request.message)
+        if items:
+            picks = None
+            if not asking and not parse_quiz_request(request.message):
+                picks = parse_picks(request.message, len(items))
+            reply = None
+            if asking:
+                reply = format_answer_key(items)
+            elif picks:
+                reply = grade_answers(items, picks)
+            if reply:
+                quiz_lectures = list(dict.fromkeys(i["lecture"] for i in items if i["lecture"]))
+                remember_answer(reply, quiz_lectures)
+                return ChatResponse(reply=reply, sources=[], lectures=quiz_lectures)
+        elif seen_quiz and (asking or parse_picks(request.message, 10)):
+            return ChatResponse(
+                reply=(
+                    "- That quiz has expired, because the server restarted.\n"
+                    '- Ask for a new one, for example "quiz me on the brachium".'
+                ),
+                sources=[],
+                lectures=[],
+            )
 
     # A student asking for practice questions ("quiz me on the brachium")
     if QUIZ_IN_CHAT:
@@ -397,9 +435,12 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 f"Quiz: {len(batch['items'])} accepted, {len(batch['rejected'])} rejected "
                 f"in {time.time() - t0:.1f}s"
             )
-            return ChatResponse(
-                reply=format_markdown(batch["items"]), sources=[], lectures=batch["lectures"]
-            )
+            items = batch["items"]
+            quiz_reply = format_quiz(items)
+            if items:
+                remember_quiz(quiz_reply, items)
+                remember_answer(quiz_reply, batch["lectures"])
+            return ChatResponse(reply=quiz_reply, sources=[], lectures=batch["lectures"])
 
     # First questions (no history) can be answered from the cache
     cacheable = not request.history

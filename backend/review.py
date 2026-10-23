@@ -1,5 +1,6 @@
 import hashlib
 import re
+import threading
 from collections import OrderedDict
 
 DISPUTE_PATTERN = re.compile(
@@ -67,3 +68,40 @@ def dispute_record(question: str, answer: str, claim: str, lectures=None) -> dic
         "lectures": lectures or [],
         "source": "dispute",
     }
+
+# Answer keys for practice quizzes sent in chat. The chat reply shows no answers; the key waits
+# here until the student asks. Keyed by the exact quiz text, so the history the frontend already
+# sends is enough to find it. In memory only: it resets when the server restarts.
+MAX_QUIZZES = 200
+_quizzes: OrderedDict[str, list[dict]] = OrderedDict()
+_quiz_lock = threading.Lock()
+QUIZ_MARK = re.compile(r"\*\*Question 1\.\*\*")
+
+
+def remember_quiz(quiz_text: str, items: list[dict]):
+    slim = [
+        {"answer": i["answer"], "explanation": i["explanation"], "lecture": i["lecture"]}
+        for i in items
+    ]
+    key = _key(quiz_text)
+    with _quiz_lock:
+        _quizzes[key] = slim
+        _quizzes.move_to_end(key)
+        while len(_quizzes) > MAX_QUIZZES:
+            _quizzes.popitem(last=False)
+
+
+def find_quiz(history):
+    """(answer key or None, whether a quiz appears in the history at all).
+    Looks from the newest assistant turn backwards."""
+    seen = False
+    for turn in reversed(history):
+        if turn.role != "assistant":
+            continue
+        with _quiz_lock:
+            items = _quizzes.get(_key(turn.content))
+        if items:
+            return items, True
+        if QUIZ_MARK.search(turn.content):
+            seen = True
+    return None, seen
