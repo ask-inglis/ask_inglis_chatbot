@@ -311,4 +311,77 @@ def save_batch(topic: str, items: list[dict]) -> str | None:
         return path
     except Exception as e:
         print(f"Question batch save failed: {e}")
-        return None
+        return None# ---------- One place that understands every quiz-related message ----------
+import difflib
+
+_VOCAB = ["answers", "answer", "questions", "question", "options", "option", "choices",
+          "quiz", "quizzes", "solutions", "practice", "another", "reveal", "mcqs"]
+_FILLER = set("""quiz quizzes question questions more another few some set sets with without answers answer
+options option choices me give make generate create write practice test on about the a an of and please
+multiple choice mcq mcqs exam but no new next again show reveal i want need can you could would like to
+for from my us one two three four five six seven eight nine ten some key keys""".split())
+
+_NEW = re.compile(
+    r"\b(quiz me|test me|practice (questions?|quiz|test)|multiple[- ]choice|mcqs?|exam questions?|"
+    r"(write|make|generate|give me|create)\b.{0,25}\b(questions?|quiz)|"
+    r"(?:more|another|few|some|\d{1,2})\s+(?:\w+\s+){0,2}(?:questions?|quiz(?:zes)?|sets?)\b.{0,40}"
+    r"\b(?:with|without)\s+(?:the\s+)?(?:answers?|options?|choices))\b",
+    re.IGNORECASE,
+)
+_FOLLOW = re.compile(r"\b(more|another|next|again|new|few|set|different)\b", re.IGNORECASE)
+_FORMAT_ONLY = re.compile(r"\b(with|without)\s+(the\s+)?(options?|choices|answers?)\b", re.IGNORECASE)
+_WITH_ANS = re.compile(
+    r"\b(?:with|and|plus|including)\s+(?:the\s+|their\s+|correct\s+)*(?:answers?|answer\s+key|solutions?)\b"
+    r"|\b(?:show|give)\s+(?:me\s+)?(?:the\s+)?answers?\b|\banswers?\s+included\b",
+    re.IGNORECASE,
+)
+_NO_ANS = re.compile(r"\b(without|no|hide|hidden)\s+(the\s+)?(answers?|answer\s+key|solutions?)\b", re.IGNORECASE)
+_QUIZ_LIKE = re.compile(r"\bQuestion\s*1[.:)]|\bquiz\b|\bpractice (questions?|set)\b", re.IGNORECASE)
+
+
+def fix_typos(text: str) -> str:
+    """'answwers' -> 'answers', 'quesions' -> 'questions'. Only touches near-misses of quiz words."""
+    out = []
+    for part in re.split(r"(\W+)", text):
+        low = part.lower()
+        if len(low) >= 5 and low.isalpha() and low not in _VOCAB:
+            hit = difflib.get_close_matches(low, _VOCAB, n=1, cutoff=0.84)
+            part = hit[0] if hit else part
+        out.append(part)
+    return "".join(out)
+
+
+def _topic(message: str, prev_text: str) -> str:
+    left = [w for w in re.findall(r"[A-Za-z]+", message) if w.lower() not in _FILLER]
+    if sum(len(w) for w in left) >= 4:
+        return message  # the message itself names the subject, e.g. "quiz me on the brachium"
+    cleaned = re.sub(r"\*+|Question\s*\d+[.:)]|Answers?:", " ", prev_text).strip()
+    return cleaned[:500] if cleaned else message  # same lectures as the quiz just shown
+
+
+def quiz_intent(message: str, prev_assistant: str = "", active: bool = False) -> dict:
+    """kind: 'new' (write a quiz), 'answers' (reveal the key), or None (not about a quiz).
+    active: the last reply was a saved quiz. prev_assistant: text of the last reply."""
+    msg = fix_typos(message or "")
+    short = len(msg.split()) <= 12
+    prev_quiz_like = active or bool(_QUIZ_LIKE.search(prev_assistant or ""))
+
+    new = bool(_NEW.search(msg))
+    if not new and prev_quiz_like and short and (_FOLLOW.search(msg) or _FORMAT_ONLY.search(msg)):
+        new = True  # "a few more", "another set", "with options" right after a quiz
+    if new and len(msg) <= 300:
+        m = COUNT_PATTERN.search(msg)
+        count = max(1, min(int(m.group(1)), MAX_PER_REQUEST)) if m else 5
+        with_answers = bool(_WITH_ANS.search(msg)) and not _NO_ANS.search(msg)
+        return {"kind": "new", "count": count, "with_answers": with_answers,
+                "topic": _topic(msg, prev_assistant)}
+    if wants_answers(msg):
+        return {"kind": "answers", "count": 0, "with_answers": True, "topic": ""}
+    return {"kind": None, "count": 0, "with_answers": False, "topic": ""}
+
+
+def format_quiz_for(items: list[dict], with_answers: bool = False) -> str:
+    """Questions with options; the answer block is added only if the student asked for it."""
+    if items and with_answers:
+        return format_markdown(items)
+    return format_quiz(items)

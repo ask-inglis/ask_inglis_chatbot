@@ -51,13 +51,12 @@ from review import (
 )
 from guides import rebuild_guides
 from questions import (
-    parse_quiz_request,
     generate_questions,
-    format_quiz,
+    format_quiz_for,
+    quiz_intent,
     format_answer_key,
     grade_answers,
     parse_picks,
-    wants_answers,
     save_batch,
 )
 from protect import allowed_origins, rate_limit, daily_cap
@@ -395,24 +394,42 @@ def chat(request: ChatRequest, background: BackgroundTasks):
             )
             return ChatResponse(reply=DISPUTE_REPLY, sources=[], lectures=[])
     
-    # Follow-ups to a practice quiz: "show answers" or "1B 2D 3A". No AI call, never cached.
-    if QUIZ_IN_CHAT and request.history:
-        items, seen_quiz = find_quiz(request.history)
-        asking = wants_answers(request.message)
+    # ---- Practice quizzes (Phase 2): every quiz-related message is handled here ----
+    if QUIZ_IN_CHAT:
+        prev = [t for t in request.history if t.role == "assistant"][-1:]  # only the last reply counts
+        items, seen_quiz = find_quiz(prev) if prev else ([], False)
+        intent = quiz_intent(request.message, prev[0].content if prev else "", bool(items) or seen_quiz)
+
+        if intent["kind"] == "new":
+            try:
+                batch = generate_questions(intent["topic"], intent["count"], generate)
+            except Exception as e:
+                print(f"Quiz generation failed: {e}")
+                raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+            print(
+                f"Quiz: {len(batch['items'])} accepted, {len(batch['rejected'])} rejected "
+                f"in {time.time() - t0:.1f}s"
+            )
+            new_items = batch["items"]
+            quiz_reply = format_quiz_for(new_items, intent["with_answers"])
+            if new_items:
+                remember_quiz(quiz_reply, new_items)
+                remember_answer(quiz_reply, batch["lectures"])
+            return ChatResponse(reply=quiz_reply, sources=[], lectures=batch["lectures"])
+
         if items:
-            picks = None
-            if not asking and not parse_quiz_request(request.message):
-                picks = parse_picks(request.message, len(items))
             reply = None
-            if asking:
+            if intent["kind"] == "answers":
                 reply = format_answer_key(items)
-            elif picks:
-                reply = grade_answers(items, picks)
+            else:
+                picks = parse_picks(request.message, len(items))
+                if picks:
+                    reply = grade_answers(items, picks)
             if reply:
                 quiz_lectures = list(dict.fromkeys(i["lecture"] for i in items if i["lecture"]))
                 remember_answer(reply, quiz_lectures)
                 return ChatResponse(reply=reply, sources=[], lectures=quiz_lectures)
-        elif seen_quiz and (asking or parse_picks(request.message, 10)):
+        elif seen_quiz and (intent["kind"] == "answers" or parse_picks(request.message, 10)):
             return ChatResponse(
                 reply=(
                     "- That quiz has expired, because the server restarted.\n"
@@ -421,26 +438,6 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 sources=[],
                 lectures=[],
             )
-
-    # A student asking for practice questions ("quiz me on the brachium")
-    if QUIZ_IN_CHAT:
-        quiz_count = parse_quiz_request(request.message)
-        if quiz_count:
-            try:
-                batch = generate_questions(request.message, quiz_count, generate)
-            except Exception as e:
-                print(f"Quiz generation failed: {e}")
-                raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
-            print(
-                f"Quiz: {len(batch['items'])} accepted, {len(batch['rejected'])} rejected "
-                f"in {time.time() - t0:.1f}s"
-            )
-            items = batch["items"]
-            quiz_reply = format_quiz(items)
-            if items:
-                remember_quiz(quiz_reply, items)
-                remember_answer(quiz_reply, batch["lectures"])
-            return ChatResponse(reply=quiz_reply, sources=[], lectures=batch["lectures"])
 
     # First questions (no history) can be answered from the cache
     cacheable = not request.history
