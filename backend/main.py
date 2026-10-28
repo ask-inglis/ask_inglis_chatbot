@@ -483,8 +483,12 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         )
     else:
         body_rule = (
-            'Only if the student asks how something differs between bodies, end with a section titled exactly '
-            '"**Body type note**" with 2 to 3 bullets.'
+            'Unless the question only asks for a name or a definition, end your answer with a section titled exactly '
+            '"**Body type note**" with 1 to 2 bullets. Say how the approach, landmarks, depth, or the structure\'s '
+            "size and position typically vary between bodies (for example slender, obese, elderly, small or large "
+            "frame, or common anatomical variants) and what that changes at the dissection table. "
+            'If the notes do not cover it, start that bullet with "General knowledge:". '
+            "If a difference could mean an abnormality, say so and tell the student to check with their instructor."
         )
 
     prompt = f"""You are a study assistant for UB Human Anatomy Laboratory students who are skimming at the dissection table.
@@ -495,7 +499,7 @@ FORMAT (very important):
 - Start with one bold line that answers the question directly.
 - Then give 3 to 6 short bullet points, each under 20 words. Use "-" for bullets.
 - Put structure names in **bold**.
-- Never write a paragraph longer than two sentences. Keep the whole answer under 150 words unless the student asks for more detail.
+- Never write a paragraph longer than two sentences. Keep the main answer under 150 words unless the student asks for more detail; the Body type note is extra.
 - {body_rule}
 - If you are not confident about a specific difference, say so. If a difference could mean an abnormality, say that and tell the
   student to check with their instructor.
