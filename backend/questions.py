@@ -67,12 +67,13 @@ def validate_item(item: dict, n_options: int = OPTIONS_PER_QUESTION) -> list[str
         return problems
 
     lens = {k: len(v) for k, v in options.items()}
-    others = sorted(l for k, l in lens.items() if k != answer)
-    median = others[len(others) // 2]
-    if lens[answer] == max(lens.values()) and lens[answer] > 1.15 * max(median, 1):
-        problems.append("the correct answer is noticeably the longest option")
-    if max(lens.values()) > 3 * max(min(lens.values()), 1):
-        problems.append("options differ a lot in length")
+    if max(lens.values()) > 30:  # the length rules are for phrase options, not short names like "Stapes"
+        others = sorted(l for k, l in lens.items() if k != answer)
+        median = others[len(others) // 2]
+        if lens[answer] == max(lens.values()) and lens[answer] > 1.15 * max(median, 1):
+            problems.append("the correct answer is noticeably the longest option")
+        if max(lens.values()) > 3 * max(min(lens.values()), 1):
+            problems.append("options differ a lot in length")
     if not item.get("explanation"):
         problems.append("missing explanation")
     return problems
@@ -149,7 +150,7 @@ Item-writing rules (NBME style):
 - Write the lead-in as a positive question. Never use NOT, EXCEPT, LEAST or INCORRECT.
 - Never use "all of the above", "none of the above", or options like "A and B".
 - Make all options the same type of thing (all nerves, all muscles, and so on), plausible, and similar in length and detail.
-- The correct answer must not be the longest option. Do not repeat words from the question inside only the correct option.
+- The correct answer must not be the longest option. Keep the correct answer short, and write every wrong option with about the same length and level of detail as the correct one. Do not repeat words from the question inside only the correct option.
 - Do not use absolute words such as always or never.
 - Do not include any fact that is not in the notes. The correct answer must be stated in the notes.
 - Use a short dissection-lab or clinical scenario when the notes support it.
@@ -162,10 +163,87 @@ Course notes:
 """
 
 
-def generate_questions(topic: str, count: int, generate) -> dict:
+def _judge(items: list[dict], notes: str, generate) -> list[list[str]]:
+    """One extra model call per batch for what the mechanical rules cannot see: are all options the
+    same kind of thing, and is the explanation supported by the notes? Returns a list of problems per
+    item. If the call or its output fails, the items pass (the other checks still ran).
+    Note: the same model that wrote the questions is judging them, so this is a screen, not proof."""
+    if not items:
+        return []
+    listing = "\n\n".join(
+        f"#{i}\nQuestion: {q['stem']}\n"
+        + "\n".join(f"{l}. {q['options'][l]}" for l in sorted(q["options"]))
+        + f"\nAnswer: {q['answer']}\nExplanation: {q['explanation']}"
+        for i, q in enumerate(items)
+    )
+    prompt = f"""You are checking exam questions against course notes.
+For each question decide:
+- same_type: true only if every option is the same kind of thing (all nerves, all muscles, all bones, and so on)
+  and no option is an obviously impossible choice for the question.
+- supported: true only if the correct answer AND the explanation are fully supported by the notes.
+  Say false if the explanation adds a fact the notes do not state.
+Return ONLY a JSON array with one object per question, in order:
+{{"id": 0, "same_type": true, "supported": true, "issue": "short reason if false"}}
+
+Course notes:
+{notes}
+
+Questions:
+{listing}
+"""
+    try:
+        verdicts = _parse_items(generate(prompt))
+    except Exception as e:
+        print(f"Judge call failed, skipping the extra check: {e}")
+        return [[] for _ in items]
+    by_id = {}
+    for v in verdicts:
+        try:
+            by_id[int(v.get("id"))] = v
+        except (TypeError, ValueError):
+            continue
+    out = []
+    for i in range(len(items)):
+        v, problems = by_id.get(i), []
+        if v:
+            if v.get("same_type") is False:
+                problems.append("options are not all the same kind of thing")
+            if v.get("supported") is False:
+                problems.append("explanation not supported by the notes")
+        out.append(problems)
+    return out
+
+
+def _evidence(item: dict, docs: list[str], metas: list[dict]) -> str:
+    """The sentences in the retrieved notes that best match the correct answer, so a reviewer can
+    compare the answer with the notes without knowing the subject. Empty if nothing matches."""
+    answer_words = set(re.findall(r"[a-z]{4,}", item["options"][item["answer"]].lower()))
+    stem_words = set(re.findall(r"[a-z]{5,}", item["stem"].lower()))
+    scored = []
+    for doc, meta in zip(docs, metas):
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", doc):
+            words = set(re.findall(r"[a-z]{4,}", sentence.lower()))
+            hits = len(answer_words & words)
+            if not hits:
+                continue
+            scored.append((2 * hits + len(stem_words & words), sentence.strip(), meta["source"]))
+    scored.sort(key=lambda t: -t[0])
+    picked, seen = [], set()
+    for _, sentence, source in scored:
+        if sentence and sentence not in seen:
+            seen.add(sentence)
+            picked.append(f"[{source}] {sentence[:300]}")
+        if len(picked) == 2:
+            break
+    return " | ".join(picked)
+
+
+def generate_questions(topic: str, count: int, generate, avoid: list[str] | None = None) -> dict:
     """Write, check and shuffle questions. `generate` is the app's LLM function.
-    A question is only returned if it passes the NBME-style checks and is grounded in the notes."""
+    A question is only returned if it passes the NBME-style checks, is grounded in the notes and
+    passes the judge check. `avoid` lists question stems that must not be repeated."""
     count = max(1, min(count, MAX_PER_REQUEST))
+    avoid = list(avoid or [])
     found = collection.query(query_texts=[topic], n_results=8)
     docs = found["documents"][0] if found["documents"] else []
     metas = found["metadatas"][0] if found["metadatas"] else []
@@ -177,14 +255,16 @@ def generate_questions(topic: str, count: int, generate) -> dict:
     rules = rule_excerpts()
     print(f"NBME excerpts used: {len(rules)} characters")
 
-    accepted, rejected, seen = [], [], set()
+    accepted, rejected = [], []
+    seen = {a.lower() for a in avoid}
     for _ in range(2):  # a second attempt fills any gaps left by rejected questions
         need = count - len(accepted)
         if need <= 0:
             break
         prompt = _build_prompt(
-            topic, min(need + 1, MAX_PER_REQUEST + 2), notes, [q["stem"] for q in accepted], rules
+            topic, min(need + 1, MAX_PER_REQUEST + 2), notes, avoid + [q["stem"] for q in accepted], rules
         )
+        candidates = []
         for raw in _parse_items(generate(prompt)):
             item = _normalize(raw)
             if item is None:
@@ -201,10 +281,16 @@ def generate_questions(topic: str, count: int, generate) -> dict:
             seen.add(item["stem"].lower())
             if item["lecture"] not in lectures:
                 item["lecture"] = ""  # don't claim a source the model made up
-            accepted.append(_shuffle_options(item))
-            if len(accepted) >= count:
+            candidates.append(item)
+            if len(candidates) >= need + 1:  # one spare, in case the judge rejects one
                 break
-    return {"items": accepted, "rejected": rejected, "lectures": lectures}
+        for item, problems in zip(candidates, _judge(candidates, notes, generate)):
+            if problems:
+                rejected.append({"stem": item["stem"][:200], "problems": problems})
+            else:
+                item["evidence"] = _evidence(item, docs, metas)
+                accepted.append(_shuffle_options(item))
+    return {"items": accepted[:count], "rejected": rejected, "lectures": lectures}
 
 
 def format_markdown(items: list[dict]) -> str:

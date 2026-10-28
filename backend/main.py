@@ -402,7 +402,10 @@ def chat(request: ChatRequest, background: BackgroundTasks):
 
         if intent["kind"] == "new":
             try:
-                batch = generate_questions(intent["topic"], intent["count"], generate)
+                    batch = generate_questions(
+                    intent["topic"], intent["count"], generate,
+                    avoid=[i["stem"] for i in items] if items else None,  # don't repeat the last quiz
+                    )
             except Exception as e:
                 print(f"Quiz generation failed: {e}")
                 raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
