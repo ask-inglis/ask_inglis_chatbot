@@ -79,10 +79,9 @@ QUIZ_MARK = re.compile(r"\*\*Question 1\.\*\*")
 
 
 def remember_quiz(quiz_text: str, items: list[dict]):
-    slim = [
-        {"answer": i["answer"], "explanation": i["explanation"], "lecture": i["lecture"]}
-        for i in items
-    ]
+    # Keep everything grading needs: options, the reason for each option, the study tip and the question text
+    keep = ("stem", "options", "answer", "explanation", "option_notes", "study_tip", "lecture")
+    slim = [{k: i.get(k, "" if k not in ("options", "option_notes") else {}) for k in keep} for i in items]
     key = _key(quiz_text)
     with _quiz_lock:
         _quizzes[key] = slim

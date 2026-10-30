@@ -17,8 +17,6 @@ import os
 import time
 import urllib.error
 import urllib.request
-from dotenv import load_dotenv
-load_dotenv()
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 TOPICS = [
@@ -79,11 +77,13 @@ def main():
                 **{l: opts.get(l, "") for l in "ABCDE"},
                 "answer": it["answer"], "explanation": it["explanation"], "lecture": it["lecture"],
                 "evidence_from_notes": it.get("evidence", ""),
+                "option_notes": json.dumps(it.get("option_notes", {}), ensure_ascii=False),
+                "study_tip": it.get("study_tip", ""),
                 "checked_against_notes": "", "keep": "", "comment": "",
             })
         time.sleep(2)  # stay well under free-tier per-minute limits
 
-    cols = ["topic", "stem", "A", "B", "C", "D", "E", "answer", "explanation", "lecture", "evidence_from_notes",
+    cols = ["topic", "stem", "A", "B", "C", "D", "E", "answer", "explanation", "lecture", "evidence_from_notes", "option_notes", "study_tip",
             "checked_against_notes", "keep", "comment"]
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)

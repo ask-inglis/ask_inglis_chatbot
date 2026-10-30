@@ -5,10 +5,14 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-from ingestion import collection, get_github_repo
+from ingestion import get_github_repo
+from retrieval import search_notes
 from guides import rule_excerpts
 
 MAX_PER_REQUEST = 10
+BATCH_SIZE = 3  # questions per model call; each now carries a reason for every option
+NOTES_MENTION = re.compile(r"\b(?:the|these|course|lecture)\s+notes\b|according to the|as stated in|as described in", re.IGNORECASE)
+LETTER_MENTION = re.compile(r"\b(?:option|choice|answer)\s+[A-E]\b|\(\s*[A-E]\s*\)", re.IGNORECASE)
 OPTIONS_PER_QUESTION = int(os.environ.get("QUESTION_OPTIONS", "5"))
 QUESTIONS_PATH = "questions/generated"  # saved batches, no review step
 LETTERS = "ABCDE"
@@ -76,6 +80,19 @@ def validate_item(item: dict, n_options: int = OPTIONS_PER_QUESTION) -> list[str
             problems.append("options differ a lot in length")
     if not item.get("explanation"):
         problems.append("missing explanation")
+    option_notes = item.get("option_notes") or {}
+    if set(option_notes) != set(options) or any(len(str(v).split()) < 4 for v in option_notes.values()):
+        problems.append("missing the reason for every option")
+    if not item.get("study_tip"):
+        problems.append("missing study tip")
+    written = " ".join([item.get("explanation", ""), item.get("study_tip", "")] + [str(v) for v in option_notes.values()])
+    if LETTER_MENTION.search(written):
+        problems.append("the explanations mention option letters, which change when options are shuffled")
+    if NOTES_MENTION.search(written):
+        problems.append("the explanations refer to 'the notes' (students see the lecture name separately)")
+    note_texts = [re.sub(r"\W+", " ", str(v).lower()).strip() for v in option_notes.values()]
+    if len(set(note_texts)) < len(note_texts):
+        problems.append("two option notes are identical")
     return problems
 
 
@@ -98,11 +115,17 @@ def _normalize(raw: dict) -> dict | None:
     for key, text in options.items():
         letter = str(key).strip().upper()[:1]
         clean[letter] = re.sub(r"^[A-E][\.\)]\s*", "", str(text).strip())
+    notes_raw = raw.get("option_notes") if isinstance(raw.get("option_notes"), dict) else {}
+    option_notes = {
+        str(k).strip().upper()[:1]: re.sub(r"^[A-E][\.\):]\s*", "", str(v).strip()) for k, v in notes_raw.items()
+    }
     return {
         "stem": str(raw.get("stem", "")).strip(),
         "options": clean,
         "answer": str(raw.get("answer", "")).strip().upper()[:1],
         "explanation": str(raw.get("explanation", "")).strip(),
+        "option_notes": option_notes,
+        "study_tip": str(raw.get("study_tip", "")).strip(),
         "lecture": str(raw.get("lecture", "")).strip(),
     }
 
@@ -119,12 +142,15 @@ def _parse_items(text: str) -> list[dict]:
 
 
 def _shuffle_options(item: dict) -> dict:
-    """Randomize which letter is correct, since models tend to favor certain letters."""
+    """Randomize which letter is correct, since models tend to favor certain letters.
+    The reason written for each option moves with its option."""
     letters = sorted(item["options"])
+    old_notes = item.get("option_notes") or {}
+    pairs = [(item["options"][l], old_notes.get(l, "")) for l in letters]
     correct_text = item["options"][item["answer"]]
-    texts = [item["options"][l] for l in letters]
-    random.shuffle(texts)
-    item["options"] = dict(zip(letters, texts))
+    random.shuffle(pairs)
+    item["options"] = {l: p[0] for l, p in zip(letters, pairs)}
+    item["option_notes"] = {l: p[1] for l, p in zip(letters, pairs)}
     item["answer"] = next(l for l, t in item["options"].items() if t == correct_text)
     return item
 
@@ -132,6 +158,7 @@ def _shuffle_options(item: dict) -> dict:
 def _build_prompt(topic: str, n: int, notes: str, avoid: list[str], rules: str) -> str:
     letters = LETTERS[:OPTIONS_PER_QUESTION]
     example_options = ", ".join(f'"{l}": "..."' for l in letters)
+    example_notes = ", ".join(f'"{l}": "..."' for l in letters)
     avoid_block = ""
     if avoid:
         avoid_block = "\nDo not repeat these questions:\n" + "\n".join(f"- {s[:120]}" for s in avoid) + "\n"
@@ -154,36 +181,64 @@ Item-writing rules (NBME style):
 - Do not use absolute words such as always or never.
 - Do not include any fact that is not in the notes. The correct answer must be stated in the notes.
 - Use a short dissection-lab or clinical scenario when the notes support it.
+- "option_notes" must cover EVERY option, including the correct one, with one or two sentences each. For the correct option, say why it is right. For each wrong option, say why it is wrong AND the mix-up that makes a student pick it (for example, confusing two nerves, two levels or two attachments). Use only facts from the notes.
+- "study_tip" is one sentence on how a student can avoid this mistake next time (for example, which two structures to compare, or what pattern to practice), based on the notes.
+- Wrong options must be plausible: structures from the same region or group that a student could genuinely confuse with the answer (neighbouring nerves, muscles of the same group, structures at the same level). Never use structures from unrelated regions just to fill the list.
+- Each option note must state the specific fact. Never write only "this is the correct answer" or "this is incorrect". Never write "the notes", "according to the notes" or "as stated". Every option note must be different.
+- The question must be anatomically accurate and have only one defensible answer. If another option could also be argued as correct from the notes, choose a different question.
+- Never mention option letters (A, B, C...) in the explanation, notes or tip. Refer to options by name, because the order is shuffled afterwards.
 {rules_block}
 Return ONLY a JSON array, with no other text. Each item looks like:
-{{"stem": "...", "options": {{{example_options}}}, "answer": "C", "explanation": "one or two sentences", "lecture": "exact lecture name from the notes label"}}
+{{"stem": "...", "options": {{{example_options}}}, "answer": "C", "explanation": "one or two sentences on why the correct answer is right", "option_notes": {{{example_notes}}}, "study_tip": "one sentence", "lecture": "exact lecture name from the notes label"}}
 {avoid_block}
 Course notes:
 {notes}
 """
 
 
-def _judge(items: list[dict], notes: str, generate) -> list[list[str]]:
-    """One extra model call per batch for what the mechanical rules cannot see: are all options the
-    same kind of thing, and is the explanation supported by the notes? Returns a list of problems per
-    item. If the call or its output fails, the items pass (the other checks still ran).
-    Note: the same model that wrote the questions is judging them, so this is a screen, not proof."""
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _quote_in_notes(quote: str, notes: str) -> bool:
+    """The judge must copy a sentence from the notes. Checked by code, not trusted."""
+    q = _norm(quote)
+    if len(q.split()) < 5:
+        return False
+    n = _norm(notes)
+    if q in n:
+        return True
+    words = q.split()
+    return sum(1 for w in words if w in set(n.split())) / len(words) >= 0.9 and q[:25] in n
+
+
+def _judge(items: list[dict], notes: str, generate) -> list[tuple[list[str], str]]:
+    """One extra model call per batch for what the mechanical rules cannot see. For each question
+    returns (problems, supporting quote). The judge must copy the sentence from the notes that states
+    the answer; the code then checks that the sentence really is in the notes, so a made-up quote fails.
+    The same model that wrote the questions is judging them, so this is a screen, not proof.
+    If the call or its output fails, the items pass with no quote (the other checks still ran)."""
     if not items:
         return []
     listing = "\n\n".join(
         f"#{i}\nQuestion: {q['stem']}\n"
         + "\n".join(f"{l}. {q['options'][l]}" for l in sorted(q["options"]))
         + f"\nAnswer: {q['answer']}\nExplanation: {q['explanation']}"
+        + "".join(f"\nNote on {l}: {t}" for l, t in sorted((q.get('option_notes') or {}).items()))
         for i, q in enumerate(items)
     )
-    prompt = f"""You are checking exam questions against course notes.
+    prompt = f"""You are a strict anatomy examiner checking exam questions against course notes.
 For each question decide:
-- same_type: true only if every option is the same kind of thing (all nerves, all muscles, all bones, and so on)
+- same_type: true only if every option is the same kind of thing (all nerves, all muscles, and so on)
   and no option is an obviously impossible choice for the question.
-- supported: true only if the correct answer AND the explanation are fully supported by the notes.
-  Say false if the explanation adds a fact the notes do not state.
+- stem_accurate: true only if the question is anatomically correct (for example, it does not give a muscle the wrong action)
+  and only ONE option can be defended as correct using the notes.
+- answer_quote: copy ONE sentence or phrase, word for word, from the notes that states the correct answer.
+  Use an empty string if the notes do not state it. Do not use outside knowledge.
+- contradicted: the letters of any note (including the correct option's) that says something the notes contradict
+  or do not support. Use [] if every note agrees with the notes.
 Return ONLY a JSON array with one object per question, in order:
-{{"id": 0, "same_type": true, "supported": true, "issue": "short reason if false"}}
+{{"id": 0, "same_type": true, "stem_accurate": true, "answer_quote": "...", "contradicted": [], "issue": "short reason if anything is false"}}
 
 Course notes:
 {notes}
@@ -195,7 +250,7 @@ Questions:
         verdicts = _parse_items(generate(prompt))
     except Exception as e:
         print(f"Judge call failed, skipping the extra check: {e}")
-        return [[] for _ in items]
+        return [([], "") for _ in items]
     by_id = {}
     for v in verdicts:
         try:
@@ -204,13 +259,20 @@ Questions:
             continue
     out = []
     for i in range(len(items)):
-        v, problems = by_id.get(i), []
+        v, problems, quote = by_id.get(i), [], ""
         if v:
             if v.get("same_type") is False:
                 problems.append("options are not all the same kind of thing")
-            if v.get("supported") is False:
-                problems.append("explanation not supported by the notes")
-        out.append(problems)
+            if v.get("stem_accurate") is False:
+                problems.append("question is inaccurate or has more than one defensible answer")
+            quote = str(v.get("answer_quote") or "").strip()
+            if not _quote_in_notes(quote, notes):
+                problems.append("the notes do not state the answer (no matching supporting sentence)")
+                quote = ""
+            bad = v.get("contradicted")
+            if isinstance(bad, list) and bad:
+                problems.append("option notes not supported by the notes: " + ", ".join(str(x) for x in bad))
+        out.append((problems, quote))
     return out
 
 
@@ -244,9 +306,8 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
     passes the judge check. `avoid` lists question stems that must not be repeated."""
     count = max(1, min(count, MAX_PER_REQUEST))
     avoid = list(avoid or [])
-    found = collection.query(query_texts=[topic], n_results=8)
-    docs = found["documents"][0] if found["documents"] else []
-    metas = found["metadatas"][0] if found["metadatas"] else []
+    # Lecture notes by default. Dissection-guide chunks are used only if the topic is about dissecting.
+    docs, metas, _ = search_notes(topic, n=8)
     if not docs:
         return {"items": [], "rejected": [], "lectures": []}
 
@@ -257,13 +318,12 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
 
     accepted, rejected = [], []
     seen = {a.lower() for a in avoid}
-    for _ in range(2):  # a second attempt fills any gaps left by rejected questions
+    for _ in range(max(2, -(-count // BATCH_SIZE) + 1)):  # small batches; extra rounds fill any gaps
         need = count - len(accepted)
         if need <= 0:
             break
-        prompt = _build_prompt(
-            topic, min(need + 1, MAX_PER_REQUEST + 2), notes, avoid + [q["stem"] for q in accepted], rules
-        )
+        ask = min(need + 1, BATCH_SIZE + 1)
+        prompt = _build_prompt(topic, ask, notes, avoid + [q["stem"] for q in accepted], rules)
         candidates = []
         for raw in _parse_items(generate(prompt)):
             item = _normalize(raw)
@@ -282,13 +342,17 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
             if item["lecture"] not in lectures:
                 item["lecture"] = ""  # don't claim a source the model made up
             candidates.append(item)
-            if len(candidates) >= need + 1:  # one spare, in case the judge rejects one
+            if len(candidates) >= ask:  # one spare, in case the judge rejects one
                 break
-        for item, problems in zip(candidates, _judge(candidates, notes, generate)):
+        for item, (problems, quote) in zip(candidates, _judge(candidates, notes, generate)):
+            answer_text = item["options"][item["answer"]].strip().lower()
+            if any(a["options"][a["answer"]].strip().lower() == answer_text for a in accepted):
+                problems = problems + ["same correct answer as another question in this set"]
             if problems:
                 rejected.append({"stem": item["stem"][:200], "problems": problems})
             else:
-                item["evidence"] = _evidence(item, docs, metas)
+                src = next((m["source"] for d, m in zip(docs, metas) if quote and _norm(quote)[:40] in _norm(d)), "")
+                item["evidence"] = f"[{src}] {quote}" if quote and src else (quote or _evidence(item, docs, metas))
                 accepted.append(_shuffle_options(item))
     return {"items": accepted[:count], "rejected": rejected, "lectures": lectures}
 
@@ -305,11 +369,10 @@ def format_markdown(items: list[dict]) -> str:
         for letter in sorted(q["options"]):
             lines.append(f"{letter}. {q['options'][letter]}  ")
         lines.append("")
-    lines.append("---\n**Answers**\n")
-    for i, q in enumerate(items, 1):
-        source = f" *({q['lecture']})*" if q["lecture"] else ""
-        lines.append(f"- **{i}. {q['answer']}**: {q['explanation']}{source}")
+    lines.append("---\n")
+    lines.append(format_answer_key(items))
     return "\n".join(lines)
+
 
 SHOW_ANSWERS = re.compile(
     r"\b(show|reveal|give|see|tell|what\s+(?:are|is))\b[^.?!]{0,25}\b(?:answers?|answer\s+key|solutions?)\b"
@@ -358,30 +421,46 @@ def format_quiz(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _rationale(q: dict, chosen: str | None = None) -> str:
+    """Paragraphs for one question: why the answer is right, why each other option is wrong and the
+    mix-up behind it, and a study tip. Older saved questions without notes fall back to the explanation."""
+    options, notes = q.get("options") or {}, q.get("option_notes") or {}
+    source = f" *({q['lecture']})*" if q.get("lecture") else ""
+    right = options.get(q["answer"])  # a quiz remembered without its options still gets its explanation
+    paras = [f"The answer is **{right or q['answer']}**. {q.get('explanation', '')}{source}"]
+    if notes:
+        if chosen and chosen != q["answer"] and chosen in notes and chosen in options:
+            paras.append(f"You chose **{options[chosen]}**. {notes[chosen]}")
+        rest = [l for l in sorted(options) if l != q["answer"] and l != chosen and l in notes]
+        if rest:
+            lead = "The other options: " if chosen and chosen != q["answer"] else "Why the other options are wrong: "
+            paras.append(lead + " ".join(f"**{options[l]}**: {notes[l]}" for l in rest))
+        if q.get("study_tip"):
+            paras.append(f"**Study tip:** {q['study_tip']}")
+    return "\n\n".join(paras)
+
+
 def format_answer_key(items: list[dict]) -> str:
-    lines = ["**Answers**\n"]
+    blocks = ["**Answers**"]
     for i, q in enumerate(items, 1):
-        source = f" *({q['lecture']})*" if q["lecture"] else ""
-        lines.append(f"- **{i}. {q['answer']}**: {q['explanation']}{source}")
-    return "\n".join(lines)
+        blocks.append(f"**Question {i}: {q['answer']}**\n\n{_rationale(q)}")
+    return "\n\n".join(blocks)
 
 
 def grade_answers(items: list[dict], picks: dict[int, str]) -> str:
-    right, lines = 0, []
+    right, blocks = 0, []
     for i, q in enumerate(items, 1):
         chosen = picks.get(i)
-        source = f" *({q['lecture']})*" if q["lecture"] else ""
         if chosen == q["answer"]:
             right += 1
-            lines.append(f"- **{i}. Correct** ({q['answer']}).")
+            status = f"Question {i}: Correct ({q['answer']})"
         elif chosen:
-            lines.append(
-                f"- **{i}. Not quite.** You chose {chosen}; the answer is **{q['answer']}**. "
-                f"{q['explanation']}{source}"
-            )
+            status = f"Question {i}: Not quite. You chose {chosen}; the answer is {q['answer']}"
         else:
-            lines.append(f"- **{i}. Not answered.** The answer is **{q['answer']}**. {q['explanation']}{source}")
-    return f"**Score: {right} of {len(items)}**\n\n" + "\n".join(lines)
+            status = f"Question {i}: Not answered. The answer is {q['answer']}"
+        blocks.append(f"**{status}**\n\n{_rationale(q, chosen)}")
+    return f"**Score: {right} of {len(items)}**\n\n" + "\n\n".join(blocks)
+
 
 def save_batch(topic: str, items: list[dict]) -> str | None:
     """Save a generated batch to questions/generated/ in the private repo, to build up a question bank."""

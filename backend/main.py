@@ -59,6 +59,7 @@ from questions import (
     parse_picks,
     save_batch,
 )
+from retrieval import search_notes
 from protect import allowed_origins, rate_limit, daily_cap
 from cache import cache_get, cache_put, cache_clear
 
@@ -452,18 +453,9 @@ def chat(request: ChatRequest, background: BackgroundTasks):
 
     query = standalone_question(request.message, request.history)
 
-    results = collection.query(
-        query_texts=[query], n_results=4, include=["documents", "metadatas", "distances"]
-    )
-    docs = results["documents"][0] if results["documents"] else []
-    metas = results["metadatas"][0] if results["metadatas"] else []
-    dists = results["distances"][0] if results["distances"] else []
+    docs, metas, dists = search_notes(query, n=4, ratio=RETRIEVAL_DISTANCE_RATIO)
     if dists:
-        print(f"Retrieval distances: {[round(d, 2) for d in dists]}")
-        # drop chunks that are much weaker matches than the best one
-        limit = max(dists[0], 0.1) * RETRIEVAL_DISTANCE_RATIO
-        keep = [i for i, d in enumerate(dists) if d <= limit]
-        docs, metas = [docs[i] for i in keep], [metas[i] for i in keep]
+        print(f"Retrieval distances: {[round(d, 2) for d in dists]}, kinds: {[m.get('kind') for m in metas]}")
     print(f"Retrieval done {time.time() - t0:.1f}s after request start")
 
     sources = [f"[{m['source']}] {d}" for d, m in zip(docs, metas)]
@@ -497,6 +489,7 @@ def chat(request: ChatRequest, background: BackgroundTasks):
     prompt = f"""You are a study assistant for UB Human Anatomy Laboratory students who are skimming at the dissection table.
 Use the notes below as your primary source. Each note excerpt starts with the lecture it came from, in [brackets].
 Don't contradict the notes. If the notes don't cover something, add a bullet that starts with "General knowledge:" and say so.
+Excerpts from files named "Class NN" are dissection guides. Use them for what to do at the table, and the lecture notes for the anatomy itself.
 
 FORMAT (very important):
 - Start with one bold line that answers the question directly.

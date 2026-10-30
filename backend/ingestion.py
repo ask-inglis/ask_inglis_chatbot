@@ -3,6 +3,7 @@ load_dotenv()
 
 import os
 import io
+import re
 import sys
 import base64
 import hashlib
@@ -11,7 +12,9 @@ from chromadb.utils import embedding_functions
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from github import Github, Auth
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from github_auth import get_notes_repo
 
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 60  # each chunk repeats the last 60 words of the previous one
@@ -23,26 +26,23 @@ collection = chroma_client.get_or_create_collection(
     embedding_function=embedding_fn,
 )
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_NOTES_REPO = os.environ.get("GITHUB_NOTES_REPO")
 GITHUB_NOTES_PATH = "data/notes"  # path inside the private notes repo, not on disk
 
-_github_client = None
+# Dissection guides are the files named "Class NN - ..." (also "ANA407 Class 33 ..."). Everything else is a lecture.
+# If your guide files are named differently, set GUIDE_NAME_PATTERN in .env to a regular expression.
+GUIDE_NAME = re.compile(os.environ.get("GUIDE_NAME_PATTERN", r"\bClass\s+\d+"), re.IGNORECASE)
+
+
+def source_kind(filename: str) -> str:
+    """'guide' for a dissection guide, 'lecture' for lecture notes. Stored on every chunk."""
+    return "guide" if GUIDE_NAME.search(filename) else "lecture"
 
 
 # ---------- Private notes repo ----------
 
 def get_github_repo():
-    global _github_client
-    if not GITHUB_TOKEN or not GITHUB_NOTES_REPO:
-        return None
-    try:
-        if _github_client is None:
-            _github_client = Github(auth=Auth.Token(GITHUB_TOKEN))
-        return _github_client.get_repo(GITHUB_NOTES_REPO)
-    except Exception as e:
-        print(f"Could not open GitHub repo '{GITHUB_NOTES_REPO}': {e}")
-        return None
+    return get_notes_repo()
 
 
 def push_to_github(filename: str, text: str):
@@ -122,12 +122,14 @@ def remove_existing_chunks(source_filename: str):
 def ingest_text(filename: str, text: str, force: bool = False, save_backup: bool = True) -> dict:
     """Chunk and store a note in ChromaDB, and back it up to the private repo."""
     current_hash = text_hash(text)
+    kind = source_kind(filename)
 
     existing = collection.get(where={"source": filename}, limit=1)
     already_ingested = (
         existing
         and existing["metadatas"]
         and existing["metadatas"][0].get("content_hash") == current_hash
+        and existing["metadatas"][0].get("kind") == kind  # chunks saved before 'kind' existed are re-ingested
     )
 
     if already_ingested and not force:
@@ -140,7 +142,7 @@ def ingest_text(filename: str, text: str, force: bool = False, save_backup: bool
         collection.add(
             documents=chunks,
             metadatas=[
-                {"source": filename, "content_hash": current_hash, "chunk_index": i}
+                {"source": filename, "content_hash": current_hash, "chunk_index": i, "kind": kind}
                 for i in range(len(chunks))
             ],
             ids=[f"{filename}_{i}" for i in range(len(chunks))],
@@ -157,7 +159,7 @@ def ingest_text(filename: str, text: str, force: bool = False, save_backup: bool
 def rebuild_from_backups():
     """Run on startup. Rebuilds ChromaDB from the .txt notes in the private repo."""
     repo = get_github_repo()
-    print(f"GitHub repo: {GITHUB_NOTES_REPO!r}, token set: {bool(GITHUB_TOKEN)}, repo opened: {repo is not None}")
+    print(f"GitHub repo: {GITHUB_NOTES_REPO!r}, repo opened: {repo is not None}")
     results = []
 
     if repo is None:
@@ -197,9 +199,55 @@ def read_docx_bytes(data: bytes) -> str:
     return "\n".join(parts)
 
 
+def _shape_text(shape) -> list[str]:
+    """Text from one slide shape: text boxes, tables and grouped shapes. Pictures are skipped,
+    so only words ever enter the index, never images."""
+    out = []
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+        for inner in shape.shapes:
+            out.extend(_shape_text(inner))
+    elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+        pass
+    elif getattr(shape, "has_table", False) and shape.has_table:
+        for row in shape.table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                out.append(" | ".join(cells))
+    elif getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+        for para in shape.text_frame.paragraphs:
+            t = "".join(run.text for run in para.runs).strip()
+            if t:
+                out.append(t)
+    return out
+
+
+def read_pptx_bytes(data: bytes) -> str:
+    """Extract text from a .pptx slide by slide. Each slide starts with a 'Slide N: title' line so
+    that retrieved chunks say which part of the guide they came from. Speaker notes are included."""
+    prs = Presentation(io.BytesIO(data))
+    parts = []
+    for n, slide in enumerate(prs.slides, 1):
+        title = ""
+        if slide.shapes.title is not None and slide.shapes.title.has_text_frame:
+            title = slide.shapes.title.text_frame.text.strip()
+        lines = []
+        for shape in slide.shapes:
+            for t in _shape_text(shape):
+                if t != title and t not in lines:
+                    lines.append(t)
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame.text.strip() if slide.notes_slide.notes_text_frame else ""
+            if notes:
+                lines.append("Notes: " + notes)
+        if lines or title:
+            parts.append(f"Slide {n}: {title}".rstrip(": ").rstrip() + "\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
 def seed_from_repo_docx(force: bool = False) -> list[dict]:
     """Read .docx files from the private repo, extract text, ingest it, and save
-    a .txt copy back to the same repo. Nothing is written to local disk."""
+    a .txt copy back to the same repo. Nothing is written to local disk.
+    .pptx files (the dissection guides) are read as text only."""
     repo = get_github_repo()
     if repo is None:
         print("GitHub not configured")
@@ -221,12 +269,14 @@ def seed_from_repo_docx(force: bool = False) -> list[dict]:
         if f.name.endswith(".doc"):
             print(f"SKIPPED (old .doc format, convert to .docx): {f.name}")
             continue
-        if not f.name.endswith(".docx"):
+        is_pptx = f.name.endswith(".pptx")
+        if not (f.name.endswith(".docx") or is_pptx):
             continue
         try:
             blob = repo.get_git_blob(f.sha)  # works for files over 1 MB
-            text = read_docx_bytes(base64.b64decode(blob.content))
-            result = ingest_text(f.name[:-5], text, force=force)
+            raw = base64.b64decode(blob.content)
+            text = read_pptx_bytes(raw) if is_pptx else read_docx_bytes(raw)
+            result = ingest_text(f.name.rsplit(".", 1)[0], text, force=force)
             print(result)
             results.append(result)
         except Exception as e:
@@ -234,7 +284,7 @@ def seed_from_repo_docx(force: bool = False) -> list[dict]:
             failed.append(f.name)
 
     if failed:
-        print("\nThese files could not be read. Re-save each one in Word as .docx:")
+        print("\nThese files could not be read. Re-save each one as .docx (notes) or .pptx (guides):")
         for name in failed:
             print(f"  - {name}")
     return results
