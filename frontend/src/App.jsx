@@ -387,19 +387,31 @@ export default function App() {
     setError("");
   };
 
-  const updateMessages = (id, fn) => {
-    setConversations((old) =>
-      old.map((item) =>
-        item.id !== id
-          ? item
-          : {
-              ...item,
-              messages: fn(item.messages),
-              lastUsedAt: Date.now(),
-            }
-      )
-    );
-  };
+const updateMessages = (id, fn) => {
+  setConversations((old) =>
+    old.map((item) => {
+      if (item.id !== id) {
+        return item;
+      }
+
+      const nextMessages = fn(item.messages);
+
+      const firstQuestion = nextMessages.find(
+        (message) => message.role === "user"
+      )?.content;
+
+      return {
+        ...item,
+        messages: nextMessages,
+        title:
+          item.title === "New conversation" && firstQuestion
+            ? firstQuestion.slice(0, 36)
+            : item.title,
+        lastUsedAt: Date.now(),
+      };
+    })
+  );
+};
 
   // Send a question to FastAPI.
   const ask = async () => {
