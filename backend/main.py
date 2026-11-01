@@ -89,14 +89,15 @@ GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45")) * 1000
 BULLSAI_API_KEY = os.environ.get("BULLSAI_API_KEY")
 BULLSAI_BASE_URL = os.environ.get("BULLSAI_BASE_URL", "https://gateway.bullsai.buffalo.edu/v1")
 BULLSAI_MODEL_NAME = os.environ.get("BULLSAI_MODEL_NAME", "openai/gpt-oss-20b")
-BULLSAI_TIMEOUT = float(os.environ.get("BULLSAI_TIMEOUT", "30"))
-BULLSAI_MAX_TOKENS = int(os.environ.get("BULLSAI_MAX_TOKENS", "1500"))
+BULLSAI_TIMEOUT = float(os.environ.get("BULLSAI_TIMEOUT", "60"))
+# A practice-question batch is long (every option has a reason), so the cap must be generous. It is only a ceiling.
+BULLSAI_MAX_TOKENS = int(os.environ.get("BULLSAI_MAX_TOKENS", "8000"))
 
 CUSTOM_LLM_API_KEY = os.environ.get("CUSTOM_LLM_API_KEY")
 CUSTOM_LLM_BASE_URL = os.environ.get("CUSTOM_LLM_BASE_URL")
 CUSTOM_LLM_MODEL_NAME = os.environ.get("CUSTOM_LLM_MODEL_NAME")
-CUSTOM_LLM_TIMEOUT = float(os.environ.get("CUSTOM_LLM_TIMEOUT", "30"))
-CUSTOM_LLM_MAX_TOKENS = int(os.environ.get("CUSTOM_LLM_MAX_TOKENS", "1500"))
+CUSTOM_LLM_TIMEOUT = float(os.environ.get("CUSTOM_LLM_TIMEOUT", "60"))
+CUSTOM_LLM_MAX_TOKENS = int(os.environ.get("CUSTOM_LLM_MAX_TOKENS", "8000"))
 
 # Images, disputes and practice questions
 MAX_IMAGE_DISTANCE = float(os.environ.get("MAX_IMAGE_DISTANCE", "1.0"))
@@ -123,6 +124,7 @@ BODY_TYPE_PATTERN = re.compile(
 limit_chat = rate_limit("chat", int(os.environ.get("CHAT_PER_MIN", "40")), 60)
 limit_feedback = rate_limit("feedback", int(os.environ.get("FEEDBACK_PER_MIN", "40")), 60)
 limit_images = rate_limit("images", int(os.environ.get("IMAGES_PER_MIN", "80")), 60)
+limit_title = rate_limit("title", int(os.environ.get("TITLE_PER_MIN", "30")), 60)
 daily_chat_cap = daily_cap(int(os.environ.get("DAILY_CHAT_LIMIT", "0")))
 
 
@@ -252,6 +254,15 @@ class Turn(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(max_length=2000)
     history: list[Turn] = Field(default_factory=list, max_length=12)
+
+
+class TitleRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)  # the student's first question
+    reply: str = Field(default="", max_length=4000)      # optional: the first answer, for context
+
+
+class TitleResponse(BaseModel):
+    title: str
 
 
 class ChatResponse(BaseModel):
@@ -403,10 +414,10 @@ def chat(request: ChatRequest, background: BackgroundTasks):
 
         if intent["kind"] == "new":
             try:
-                    batch = generate_questions(
+                batch = generate_questions(
                     intent["topic"], intent["count"], generate,
                     avoid=[i["stem"] for i in items] if items else None,  # don't repeat the last quiz
-                    )
+                )
             except Exception as e:
                 print(f"Quiz generation failed: {e}")
                 raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
@@ -415,11 +426,13 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 f"in {time.time() - t0:.1f}s"
             )
             new_items = batch["items"]
+            # list only the lectures the questions came from, not every lecture the search touched
+            used = list(dict.fromkeys(i["lecture"] for i in new_items if i["lecture"])) or batch["lectures"]
             quiz_reply = format_quiz_for(new_items, intent["with_answers"])
             if new_items:
                 remember_quiz(quiz_reply, new_items)
-                remember_answer(quiz_reply, batch["lectures"])
-            return ChatResponse(reply=quiz_reply, sources=[], lectures=batch["lectures"])
+                remember_answer(quiz_reply, used)
+            return ChatResponse(reply=quiz_reply, sources=[], lectures=used)
 
         if items:
             reply = None
@@ -442,6 +455,17 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 sources=[],
                 lectures=[],
             )
+
+    elif quiz_intent(request.message)["kind"] == "new":
+        # Practice questions are not public yet: don't answer a quiz request with unchecked free text
+        return ChatResponse(
+            reply=(
+                "- Practice questions aren't available yet.\n"
+                '- Ask me about a lecture topic instead, for example "What does the biceps brachii do?"'
+            ),
+            sources=[],
+            lectures=[],
+        )
 
     # First questions (no history) can be answered from the cache
     cacheable = not request.history
@@ -485,6 +509,12 @@ def chat(request: ChatRequest, background: BackgroundTasks):
             'If the notes do not cover it, start that bullet with "General knowledge:". '
             "If a difference could mean an abnormality, say so and tell the student to check with their instructor."
         )
+
+    body_rule += (
+        " Each body type bullet must name one concrete change at the table (for example a landmark that is harder to "
+        "palpate, a structure that lies deeper, or a thinner tendon), never vague wording. "
+        'Use "General knowledge:" only for facts that are not in the notes.'
+    )
 
     prompt = f"""You are a study assistant for UB Human Anatomy Laboratory students who are skimming at the dissection table.
 Use the notes below as your primary source. Each note excerpt starts with the lecture it came from, in [brackets].
@@ -548,6 +578,36 @@ Answer:"""
 
 
 # ---------- Images ----------
+
+def _clean_title(text: str, fallback: str) -> str:
+    title = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    title = re.sub(r"^\W*title\s*:\s*", "", title.replace("*", ""), flags=re.IGNORECASE)
+    title = title.strip().strip("\"'`#- ").rstrip(".!?:")
+    words = title.split()
+    if not words:
+        words = fallback.split()
+    title = " ".join(words[:7])
+    return title[:60] or "New conversation"
+
+
+@app.post("/title", response_model=TitleResponse, dependencies=[Depends(limit_title)])
+def conversation_title(req: TitleRequest):
+    """Short title for a conversation, from the first question. Never fails: if the model is
+    unavailable, the title is the first few words of the question."""
+    fallback = req.message.strip()
+    prompt = f"""Write a short title (3 to 6 words) for a student's study chat about human anatomy.
+Use title case. No quotes, no ending punctuation, no emoji. Return only the title.
+
+Student's first question: {req.message[:500]}
+{('Answer given: ' + req.reply[:500]) if req.reply else ''}
+
+Title:"""
+    try:
+        return TitleResponse(title=_clean_title(generate(prompt), fallback))
+    except Exception as e:
+        print(f"Title generation failed: {e}")
+        return TitleResponse(title=_clean_title("", fallback))
+
 
 @app.get("/images", dependencies=[Depends(limit_images)])
 def images_for(query: str, limit: int = 3):
