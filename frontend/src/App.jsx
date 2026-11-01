@@ -1,3 +1,4 @@
+
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
@@ -17,7 +18,6 @@ const makeConversation = () => ({
   lastUsedAt: Date.now(),
 });
 
-// Load conversations and remove expired ones.
 function readConversations() {
   try {
     const saved = JSON.parse(
@@ -32,7 +32,6 @@ function readConversations() {
         )
       : [];
 
-    // Preserve old conversations without timestamps.
     const migrated = valid.map((item) => ({
       ...item,
       lastUsedAt: Number(item.lastUsedAt) || now,
@@ -47,7 +46,6 @@ function readConversations() {
   }
 }
 
-// Convert Markdown-style inline formatting to React elements.
 function formatInline(text) {
   const parts = String(text).split(
     /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\n]+\*)/g
@@ -55,41 +53,27 @@ function formatInline(text) {
 
   return parts.map((part, index) => {
     if (part.startsWith("**") && part.endsWith("**")) {
-      return (
-        <strong key={index}>
-          {part.slice(2, -2)}
-        </strong>
-      );
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
     }
 
     if (part.startsWith("`") && part.endsWith("`")) {
-      return (
-        <code key={index}>
-          {part.slice(1, -1)}
-        </code>
-      );
+      return <code key={index}>{part.slice(1, -1)}</code>;
     }
 
     if (part.startsWith("*") && part.endsWith("*")) {
-      return (
-        <em key={index}>
-          {part.slice(1, -1)}
-        </em>
-      );
+      return <em key={index}>{part.slice(1, -1)}</em>;
     }
 
     return <span key={index}>{part}</span>;
   });
 }
 
-// Display AI answers with paragraphs, headings, bullets and bold text.
 function FormattedAnswer({ content }) {
   const lines = String(content || "")
     .replace(/\r\n/g, "\n")
     .split("\n");
 
   const blocks = [];
-
   let buffer = [];
   let listType = null;
   let listItems = [];
@@ -129,7 +113,6 @@ function FormattedAnswer({ content }) {
           type: "code",
           text: codeLines.join("\n"),
         });
-
         codeLines = [];
       }
 
@@ -153,12 +136,7 @@ function FormattedAnswer({ content }) {
     if (heading) {
       flushText();
       flushList();
-
-      blocks.push({
-        type: "heading",
-        text: heading[1],
-      });
-
+      blocks.push({ type: "heading", text: heading[1] });
       return;
     }
 
@@ -197,11 +175,7 @@ function FormattedAnswer({ content }) {
     <div className="formatted-answer">
       {blocks.map((block, i) => {
         if (block.type === "heading") {
-          return (
-            <h3 key={i}>
-              {formatInline(block.text)}
-            </h3>
-          );
+          return <h3 key={i}>{formatInline(block.text)}</h3>;
         }
 
         if (block.type === "code") {
@@ -250,10 +224,7 @@ function FormattedAnswer({ content }) {
 export default function App() {
   const [conversations, setConversations] = useState(() => {
     const previous = readConversations();
-
-    return previous.length
-      ? previous
-      : [makeConversation()];
+    return previous.length ? previous : [makeConversation()];
   });
 
   const [activeId, setActiveId] = useState(null);
@@ -273,7 +244,6 @@ export default function App() {
 
   const messages = current?.messages || [];
 
-  // Save conversations in browser storage.
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -285,14 +255,13 @@ export default function App() {
     }
   }, [conversations]);
 
-  // Ensure an active conversation exists.
   useEffect(() => {
     if (!conversations.some((item) => item.id === activeId)) {
       setActiveId(conversations[0]?.id || null);
     }
   }, [conversations, activeId]);
 
-  // Remove conversations inactive for 7 days.
+  // Remove conversations inactive for seven days.
   useEffect(() => {
     const prune = () => {
       const now = Date.now();
@@ -302,32 +271,23 @@ export default function App() {
           (item) => now - item.lastUsedAt < RETENTION_MS
         );
 
-        if (retained.length === old.length) {
-          return old;
-        }
-
-        return retained.length
+        return retained.length === old.length
+          ? old
+          : retained.length
           ? retained
           : [makeConversation()];
       });
     };
 
     const onVisibility = () => {
-      if (!document.hidden) {
-        prune();
-      }
+      if (!document.hidden) prune();
     };
 
     window.addEventListener("focus", prune);
-
-    document.addEventListener(
-      "visibilitychange",
-      onVisibility
-    );
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       window.removeEventListener("focus", prune);
-
       document.removeEventListener(
         "visibilitychange",
         onVisibility
@@ -335,7 +295,6 @@ export default function App() {
     };
   }, []);
 
-  // Scroll to the newest message.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
       behavior: "smooth",
@@ -387,39 +346,87 @@ export default function App() {
     setError("");
   };
 
-const updateMessages = (id, fn) => {
-  setConversations((old) =>
-    old.map((item) => {
-      if (item.id !== id) {
-        return item;
+  // Update messages and apply a temporary first-question title.
+  const updateMessages = (id, fn) => {
+    setConversations((old) =>
+      old.map((item) => {
+        if (item.id !== id) return item;
+
+        const nextMessages = fn(item.messages);
+
+        const firstQuestion = nextMessages.find(
+          (msg) => msg.role === "user"
+        )?.content;
+
+        return {
+          ...item,
+          messages: nextMessages,
+          title:
+            item.title === "New conversation" && firstQuestion
+              ? firstQuestion.slice(0, 36)
+              : item.title,
+          lastUsedAt: Date.now(),
+        };
+      })
+    );
+  };
+
+  // NEW: Generate a title with the backend /title endpoint.
+  const generateTitle = async (
+    conversationId,
+    firstQuestion
+  ) => {
+    const fallbackTitle = firstQuestion.slice(0, 36);
+
+    try {
+      const response = await fetch(`${API_URL}/title`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: firstQuestion,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `Title request failed (${response.status})`
+        );
       }
 
-      const nextMessages = fn(item.messages);
+      const data = await response.json();
 
-      const firstQuestion = nextMessages.find(
-        (message) => message.role === "user"
-      )?.content;
+      const title =
+        typeof data.title === "string"
+          ? data.title.trim().slice(0, 60)
+          : "";
 
-      return {
-        ...item,
-        messages: nextMessages,
-        title:
-          item.title === "New conversation" && firstQuestion
-            ? firstQuestion.slice(0, 36)
-            : item.title,
-        lastUsedAt: Date.now(),
-      };
-    })
-  );
-};
+      if (!title) return;
 
-  // Send a question to FastAPI.
+      setConversations((old) =>
+        old.map((item) =>
+          item.id === conversationId &&
+          item.messages[0]?.content === firstQuestion &&
+          (item.title === fallbackTitle ||
+            item.title === "New conversation")
+            ? { ...item, title }
+            : item
+        )
+      );
+    } catch (err) {
+      // Keep the first question as the title if AI generation fails.
+      console.warn(
+        "Automatic title unavailable; keeping the original title.",
+        err
+      );
+    }
+  };
+
   const ask = async () => {
     const text = question.trim();
 
-    if (!text || !current || loadingId) {
-      return;
-    }
+    if (!text || !current || loadingId) return;
 
     const id = current.id;
     const previous = [...current.messages];
@@ -430,29 +437,16 @@ const updateMessages = (id, fn) => {
       content: text,
     };
 
-    // Send only the last 6 previous messages.
     const history = previous
       .slice(-6)
-      .map(({ role, content }) => ({
-        role,
-        content,
-      }));
+      .map(({ role, content }) => ({ role, content }));
 
-    updateMessages(id, (old) => [
-      ...old,
-      userMessage,
-    ]);
+    updateMessages(id, (old) => [...old, userMessage]);
 
-    setConversations((old) =>
-      old.map((item) =>
-        item.id === id && item.messages.length === 0
-          ? {
-              ...item,
-              title: text.slice(0, 36),
-            }
-          : item
-      )
-    );
+    // NEW: Request an AI-generated title only on the first question.
+    if (previous.length === 0) {
+      void generateTitle(id, text);
+    }
 
     setQuestion("");
     setError("");
@@ -502,35 +496,29 @@ const updateMessages = (id, fn) => {
     }
   };
 
-  // Submit student feedback.
   const submitFeedback = async (
     message,
     rating,
     comment = ""
   ) => {
-    if (message.feedback || feedbackPendingId) {
-      return;
-    }
+    if (message.feedback || feedbackPendingId) return;
 
     setFeedbackPendingId(message.id);
 
     try {
-      const response = await fetch(
-        `${API_URL}/feedback`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            question: message.question || "",
-            answer: message.content,
-            rating,
-            comment,
-            lectures: message.lectures || [],
-          }),
-        }
-      );
+      const response = await fetch(`${API_URL}/feedback`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          question: message.question || "",
+          answer: message.content,
+          rating,
+          comment,
+          lectures: message.lectures || [],
+        }),
+      });
 
       if (!response.ok) {
         throw new Error(
@@ -553,10 +541,7 @@ const updateMessages = (id, fn) => {
       setFeedbackComment("");
     } catch (err) {
       console.error(err);
-
-      window.alert(
-        "Feedback could not be submitted."
-      );
+      window.alert("Feedback could not be submitted.");
     } finally {
       setFeedbackPendingId(null);
     }
@@ -593,9 +578,7 @@ const updateMessages = (id, fn) => {
               <button
                 className="conversation-select"
                 type="button"
-                onClick={() =>
-                  selectConversation(item.id)
-                }
+                onClick={() => selectConversation(item.id)}
                 title={item.title}
               >
                 {item.title}
@@ -606,9 +589,7 @@ const updateMessages = (id, fn) => {
                 type="button"
                 title="Delete conversation"
                 aria-label={`Delete ${item.title}`}
-                onClick={() =>
-                  deleteConversation(item.id)
-                }
+                onClick={() => deleteConversation(item.id)}
               >
                 ×
               </button>
@@ -617,8 +598,8 @@ const updateMessages = (id, fn) => {
         </div>
 
         <p className="retention-note">
-          Inactive conversations are removed from this
-          browser after {RETENTION_DAYS} days.
+          Inactive conversations are removed from this browser
+          after {RETENTION_DAYS} days.
         </p>
       </aside>
 
@@ -640,24 +621,17 @@ const updateMessages = (id, fn) => {
         <section className="messages" aria-live="polite">
           {messages.length === 0 && (
             <div className="welcome">
-              <div className="welcome-emblem">
-                ✦
-              </div>
-
+              <div className="welcome-emblem">✦</div>
               <h1>What would you like to learn?</h1>
-
               <p>
-                Ask a question about human anatomy or
-                your lecture notes.
+                Ask a question about human anatomy or your
+                lecture notes.
               </p>
             </div>
           )}
 
           {messages.map((message) => (
-            <div
-              className="message-row"
-              key={message.id}
-            >
+            <div className="message-row" key={message.id}>
               <article
                 className={`message ${
                   message.role === "user"
@@ -672,9 +646,7 @@ const updateMessages = (id, fn) => {
                 </div>
 
                 {message.role === "assistant" ? (
-                  <FormattedAnswer
-                    content={message.content}
-                  />
+                  <FormattedAnswer content={message.content} />
                 ) : (
                   <div className="user-text">
                     {message.content}
@@ -685,26 +657,23 @@ const updateMessages = (id, fn) => {
                   <>
                     {message.degraded && (
                       <p className="notice">
-                        The assistant is temporarily
-                        using retrieved note excerpts.
+                        The assistant is temporarily using
+                        retrieved note excerpts.
                       </p>
                     )}
 
                     {message.lectures?.length > 0 && (
                       <div className="sources">
                         <b>Lecture sources</b>
-
                         <div>
-                          {message.lectures.map(
-                            (lecture, i) => (
-                              <span
-                                className="source-chip"
-                                key={`${lecture}-${i}`}
-                              >
-                                {lecture}
-                              </span>
-                            )
-                          )}
+                          {message.lectures.map((lecture, i) => (
+                            <span
+                              className="source-chip"
+                              key={`${lecture}-${i}`}
+                            >
+                              {lecture}
+                            </span>
+                          ))}
                         </div>
                       </div>
                     )}
@@ -757,10 +726,7 @@ const updateMessages = (id, fn) => {
                 <div className="message-author">
                   Ask Inglis
                 </div>
-
-                <span className="thinking">
-                  Thinking…
-                </span>
+                <span className="thinking">Thinking…</span>
               </article>
             </div>
           )}
@@ -781,9 +747,7 @@ const updateMessages = (id, fn) => {
               aria-label="Ask an anatomy question"
               value={question}
               maxLength={2000}
-              onChange={(e) =>
-                setQuestion(e.target.value)
-              }
+              onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={(e) => {
                 if (
                   e.key === "Enter" &&
@@ -801,10 +765,7 @@ const updateMessages = (id, fn) => {
             <button
               type="button"
               className="send-button"
-              disabled={
-                !question.trim() ||
-                Boolean(loadingId)
-              }
+              disabled={!question.trim() || Boolean(loadingId)}
               onClick={ask}
             >
               Send
@@ -818,20 +779,16 @@ const updateMessages = (id, fn) => {
       </main>
 
       {feedbackTarget && (
-        <div className="modal-overlay">
+        <div className="modal-overlay" role="presentation">
           <div
             className="modal"
             role="dialog"
             aria-modal="true"
             aria-labelledby="feedback-title"
           >
-            <h2 id="feedback-title">
-              What went wrong?
-            </h2>
-
+            <h2 id="feedback-title">What went wrong?</h2>
             <p>
-              Your feedback helps the instructor
-              review answers.
+              Your feedback helps the instructor review answers.
             </p>
 
             <textarea
@@ -848,10 +805,8 @@ const updateMessages = (id, fn) => {
             <div className="modal-actions">
               <button
                 type="button"
+                onClick={() => setFeedbackTarget(null)}
                 disabled={Boolean(feedbackPendingId)}
-                onClick={() =>
-                  setFeedbackTarget(null)
-                }
               >
                 Cancel
               </button>
