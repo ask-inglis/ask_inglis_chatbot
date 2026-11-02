@@ -1,11 +1,22 @@
+"""Student feedback persistence and professor review resolution.
+
+For GitHub App bot commit attribution on RESOLUTION writes, configure:
+  GITHUB_BOT_NAME=your-app-slug[bot]
+  GITHUB_BOT_EMAIL=BOT_USER_ID+your-app-slug[bot]@users.noreply.github.com
+
+Uses the existing GitHub repository authentication from ingestion.py. Never
+prints secrets and never writes a feedback resolution under a fallback user.
+"""
 import hashlib
 import json
+import os
 import re
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 
+from github import InputGitAuthor
 from ingestion import get_github_repo
 
 FEEDBACK_PATH = "feedback"
@@ -31,6 +42,22 @@ def _with_retry(action, what: str, attempts: int = 3):
             time.sleep(1.5 * (n + 1))
 
 
+def _resolution_bot_identity() -> InputGitAuthor:
+    """Require configured GitHub App bot Git author; never fall back silently."""
+    name = os.getenv("GITHUB_BOT_NAME", "").strip()
+    email = os.getenv("GITHUB_BOT_EMAIL", "").strip()
+    if not name.endswith("[bot]") or not re.fullmatch(
+        r"\d+\+[A-Za-z0-9][A-Za-z0-9-]*\[bot\]@users\.noreply\.github\.com",
+        email,
+        flags=re.IGNORECASE,
+    ) or email.split("+", 1)[1].split("@", 1)[0].casefold() != name.casefold():
+        raise ValueError(
+            "Configure GITHUB_BOT_NAME and GITHUB_BOT_EMAIL in the student backend .env "
+            "using the GitHub App bot account's actual login and numeric user ID"
+        )
+    return InputGitAuthor(name, email)
+
+
 def make_fingerprint(question: str) -> str:
     """Same question, same fingerprint, so repeated reports can be grouped."""
     norm = " ".join(re.sub(r"[^a-z0-9 ]", "", question.lower()).split())[:120]
@@ -44,12 +71,10 @@ def save_feedback(record: dict) -> bool:
     if repo is None:
         print("WARNING: GitHub not configured, feedback was NOT saved")
         return False
-
     folder = RATING_FOLDERS.get(record.get("rating"))
     if folder is None:
         print(f"Feedback not saved: unknown rating {record.get('rating')!r}")
         return False
-
     now = datetime.now(timezone.utc)
     feedback_id = f"{now.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
     record = {**record, "id": feedback_id, "created_at": now.isoformat()}
@@ -146,7 +171,6 @@ def build_queue(status: str = "pending_review", limit: int = 50) -> list[dict]:
         comment = it.get("comment", "").strip()
         if comment and comment not in g["comments"] and len(g["comments"]) < 5:
             g["comments"].append(comment)
-
     ordered = sorted(groups.values(), key=lambda g: g["last_seen"], reverse=True)
     ordered.sort(key=lambda g: (g["reason"] != "incorrect", -g["count"]))
     return ordered[:limit]
@@ -156,6 +180,12 @@ def resolve_feedback(feedback_id: str, decision: str, comment: str = "") -> dict
     """A human closes a thumbs-down: note_fixed, answer_was_correct or dismissed."""
     repo = get_github_repo()
     if repo is None or not ID_PATTERN.match(feedback_id) or decision not in DECISIONS:
+        return None
+    # Do not attempt a write if the bot identity is missing: no personal-name commits.
+    try:
+        bot = _resolution_bot_identity()
+    except ValueError as exc:
+        print(f"Resolve feedback configuration error: {exc}")
         return None
     path = f"{FEEDBACK_PATH}/down/{feedback_id}.json"
 
@@ -168,7 +198,14 @@ def resolve_feedback(feedback_id: str, decision: str, comment: str = "") -> dict
             reviewer_comment=comment[:1000],
             resolved_at=datetime.now(timezone.utc).isoformat(),
         )
-        repo.update_file(path, f"Resolve feedback {feedback_id}", json.dumps(rec, indent=2), f.sha)
+        repo.update_file(
+            path,
+            f"Resolve feedback {feedback_id}",
+            json.dumps(rec, indent=2),
+            f.sha,
+            author=bot,
+            committer=bot,
+        )
         return rec
 
     with _write_lock:
