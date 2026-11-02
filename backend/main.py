@@ -84,6 +84,8 @@ GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-3.5-flash")
 GEMINI_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()
 ]
+# Optional: a stronger model used only for writing practice questions (chat keeps the fast main model)
+GEMINI_QUIZ_MODEL = os.environ.get("GEMINI_QUIZ_MODEL", "").strip()
 GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "45")) * 1000
 
 BULLSAI_API_KEY = os.environ.get("BULLSAI_API_KEY")
@@ -166,10 +168,12 @@ def call_openai_style(client, model_name, prompt, max_tokens, label):
     return (response.choices[0].message.content or "").strip()
 
 
-def call_gemini(prompt: str) -> str:
-    """Try the main model, then each fallback model, so one overloaded model doesn't stop the chat."""
+def call_gemini(prompt: str, first_model: str = "") -> str:
+    """Try the main model, then each fallback model, so one overloaded model doesn't stop the chat.
+    first_model: a model to try before the usual list (used for practice questions)."""
     last_error = None
-    for model_name in [GEMINI_MODEL_NAME] + GEMINI_FALLBACK_MODELS:
+    order = list(dict.fromkeys(([first_model] if first_model else []) + [GEMINI_MODEL_NAME] + GEMINI_FALLBACK_MODELS))
+    for model_name in order:
         start = time.time()
         try:
             response = gemini_client.models.generate_content(model=model_name, contents=prompt)
@@ -208,6 +212,13 @@ def generate(prompt: str) -> str:
             print("Falling back to Gemini")
             return call_gemini(prompt)
         raise
+
+
+def generate_quiz(prompt: str) -> str:
+    """Same as generate(), but uses GEMINI_QUIZ_MODEL first when Gemini is the provider and one is set."""
+    if LLM_PROVIDER == "gemini" and GEMINI_QUIZ_MODEL and gemini_client is not None:
+        return call_gemini(prompt, first_model=GEMINI_QUIZ_MODEL)
+    return generate(prompt)
 
 
 def require_admin(x_admin_key: str = Header(default="")):
@@ -415,7 +426,7 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         if intent["kind"] == "new":
             try:
                 batch = generate_questions(
-                    intent["topic"], intent["count"], generate,
+                    intent["topic"], intent["count"], generate_quiz,
                     avoid=[i["stem"] for i in items] if items else None,  # don't repeat the last quiz
                 )
             except Exception as e:
@@ -756,7 +767,7 @@ def admin_generate_questions(req: QuestionRequest):
     """Build a batch of questions using the NBME guide. With save=true the batch is stored in the
     private repo under questions/generated/."""
     try:
-        batch = generate_questions(req.topic, req.count, generate)
+        batch = generate_questions(req.topic, req.count, generate_quiz)
     except Exception as e:
         print(f"Question generation failed: {e}")
         raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")

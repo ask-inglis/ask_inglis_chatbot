@@ -2,7 +2,10 @@ import json
 import os
 import random
 import re
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from itertools import zip_longest
 from datetime import datetime, timezone
 
 from ingestion import get_github_repo
@@ -10,6 +13,14 @@ from retrieval import search_notes
 from guides import rule_excerpts
 
 MAX_PER_REQUEST = 10
+PARALLEL_CALLS = max(1, int(os.environ.get("QUIZ_PARALLEL_CALLS", "3")))  # model calls run at the same time
+MAX_ROUNDS = 3  # rounds of writing + checking before giving up
+ANGLES = [
+    "where structures attach, start, end or are located",
+    "nerve supply, blood supply and what the structure does",
+    "clinical cases: injuries, deficits and what a dissection shows",
+    "relations to neighbouring structures, boundaries and course",
+]
 BATCH_SIZE = 3  # questions per model call; each now carries a reason for every option
 NOTES_MENTION = re.compile(r"\b(?:the|these|course|lecture)\s+notes\b|according to the|as stated in|as described in", re.IGNORECASE)
 LETTER_MENTION = re.compile(r"\b(?:option|choice|answer)\s+[A-E]\b|\(\s*[A-E]\s*\)", re.IGNORECASE)
@@ -107,6 +118,28 @@ def is_grounded(item: dict, notes: str) -> bool:
     return sum(1 for w in words if w in text) / len(words) >= MIN_GROUNDED
 
 
+_NOTES_LEAD = re.compile(
+    r"\b(?:according to|as (?:stated|described|noted|mentioned|shown) in|per)\s+(?:the|these|course|lecture)\s+notes,?\s*",
+    re.IGNORECASE)
+_NOTES_SAYS = re.compile(
+    r"\b(?:the|these|course|lecture)\s+notes\s+(?:state|say|describe|indicate|mention|note|show)s?\s+(?:that\s+)?",
+    re.IGNORECASE)
+
+
+def _same_answer(a: str, b: str) -> bool:
+    """'Supraglenoid tubercle' and 'Supraglenoid tubercle of the scapula' are the same answer."""
+    wa = set(re.findall(r"[a-z]{3,}", a.lower())) - {"the", "and", "with", "from"}
+    wb = set(re.findall(r"[a-z]{3,}", b.lower())) - {"the", "and", "with", "from"}
+    return bool(wa and wb and (wa <= wb or wb <= wa))
+
+
+def _scrub(text: str) -> str:
+    """Remove phrases like 'according to the notes,' so a good question isn't thrown away for wording."""
+    out = _NOTES_SAYS.sub("", _NOTES_LEAD.sub("", text or ""))
+    out = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out.strip())
+    return out
+
+
 def _normalize(raw: dict) -> dict | None:
     options = raw.get("options")
     if not isinstance(options, dict):
@@ -117,15 +150,15 @@ def _normalize(raw: dict) -> dict | None:
         clean[letter] = re.sub(r"^[A-E][\.\)]\s*", "", str(text).strip())
     notes_raw = raw.get("option_notes") if isinstance(raw.get("option_notes"), dict) else {}
     option_notes = {
-        str(k).strip().upper()[:1]: re.sub(r"^[A-E][\.\):]\s*", "", str(v).strip()) for k, v in notes_raw.items()
+        str(k).strip().upper()[:1]: re.sub(r"^[A-E][\.\):]\s*", "", _scrub(str(v).strip())) for k, v in notes_raw.items()
     }
     return {
         "stem": str(raw.get("stem", "")).strip(),
         "options": clean,
         "answer": str(raw.get("answer", "")).strip().upper()[:1],
-        "explanation": str(raw.get("explanation", "")).strip(),
+        "explanation": _scrub(str(raw.get("explanation", "")).strip()),
         "option_notes": option_notes,
-        "study_tip": str(raw.get("study_tip", "")).strip(),
+        "study_tip": _scrub(str(raw.get("study_tip", "")).strip()),
         "lecture": str(raw.get("lecture", "")).strip(),
     }
 
@@ -169,7 +202,8 @@ def _build_prompt(topic: str, n: int, notes: str, avoid: list[str], rules: str) 
             "follow the guide:\n" + rules + "\n"
         )
     return f"""Write {n} single-best-answer multiple-choice questions for UB anatomy students about: {topic}
-Use ONLY the course notes below. If the notes do not contain enough information about the topic, return an empty array [].
+Use ONLY the course notes below. Write as many good questions as the notes support, up to {n}. Fewer is fine.
+Return an empty array [] only if the notes contain nothing at all about the topic.
 
 Item-writing rules (NBME style):
 - Each question tests one important idea from the notes and has exactly {OPTIONS_PER_QUESTION} options, with ONE clearly best answer.
@@ -185,6 +219,7 @@ Item-writing rules (NBME style):
 - "study_tip" is one sentence on how a student can avoid this mistake next time (for example, which two structures to compare, or what pattern to practice), based on the notes.
 - Wrong options must be plausible: structures from the same region or group that a student could genuinely confuse with the answer (neighbouring nerves, muscles of the same group, structures at the same level). Never use structures from unrelated regions just to fill the list.
 - Each option note must state the specific fact. Never write only "this is the correct answer" or "this is incorrect". Never write "the notes", "according to the notes" or "as stated". Every option note must be different.
+- Every option, right or wrong, must be a real anatomical structure, term, finding or sign that a student could meet in the course. Never invent a term to fill a slot, and never use a function or action as an option when the other options are structures.
 - The question must be anatomically accurate and have only one defensible answer. If another option could also be argued as correct from the notes, choose a different question.
 - Never mention option letters (A, B, C...) in the explanation, notes or tip. Refer to options by name, because the order is shuffled afterwards.
 {rules_block}
@@ -246,20 +281,30 @@ Course notes:
 Questions:
 {listing}
 """
-    try:
-        verdicts = _parse_items(generate(prompt))
-    except Exception as e:
-        print(f"Judge call failed, skipping the extra check: {e}")
-        return [([], "") for _ in items]
     by_id = {}
-    for v in verdicts:
+    for attempt in (1, 2):  # an empty or broken reply (or a quota error) gets one more try
         try:
-            by_id[int(v.get("id"))] = v
-        except (TypeError, ValueError):
-            continue
+            verdicts = _parse_items(generate(prompt))
+        except Exception as e:
+            print(f"Judge call {attempt} failed: {repr(e)[:120]}")
+            verdicts = []
+        for v in verdicts:
+            try:
+                by_id[int(v.get("id"))] = v
+            except (TypeError, ValueError):
+                continue
+        if all(i in by_id for i in range(len(items))):
+            break
+        if attempt == 1:
+            time.sleep(3)
     out = []
     for i in range(len(items)):
         v, problems, quote = by_id.get(i), [], ""
+        if not v:
+            # Never show a question the checker did not read: drop it, and the next round writes another.
+            print(f"Quiz: question {i + 1} could not be checked, so it was dropped.")
+            out.append((["could not be checked by the second model call"], ""))
+            continue
         if v:
             if v.get("same_type") is False:
                 problems.append("options are not all the same kind of thing")
@@ -300,6 +345,37 @@ def _evidence(item: dict, docs: list[str], metas: list[dict]) -> str:
     return " | ".join(picked)
 
 
+def _fix_topic_spelling(topic: str, docs: list[str]) -> str:
+    """'axilliary nerves' -> 'axillary nerves', using words that actually appear in the retrieved notes."""
+    vocab = sorted({w.lower() for d in docs for w in re.findall(r"[A-Za-z]{5,}", d)})
+    out = []
+    for w in topic.split():
+        low = w.lower()
+        if len(low) >= 5 and low.isalpha() and low not in vocab:
+            hit = difflib.get_close_matches(low, vocab, n=1, cutoff=0.8)
+            w = hit[0] if hit else w
+        out.append(w)
+    return " ".join(out)
+
+
+def _write_batch(prompt: str, generate) -> list[dict]:
+    """One model call that returns a list of raw question dicts. Asks once more if the model says there is nothing."""
+    reply = generate(prompt)
+    parsed = _parse_items(reply)
+    if not parsed and reply.strip() == "[]":
+        print("Quiz: empty list on the first try; asking once more.")
+        reply = generate(prompt + "\nThe notes above DO cover this topic. Write the questions now, "
+                         "using the closest facts in the notes. Do not return an empty array.")
+        parsed = _parse_items(reply)
+    if not parsed:
+        if reply.strip() == "[]":
+            print("Quiz: the model returned an empty list, so it judged the notes or the rules too limiting.")
+        else:
+            print(f"Quiz: the model's reply had no readable questions ({len(reply)} characters). "
+                  f"Ends with: {reply[-60:]!r}")
+    return parsed
+
+
 def generate_questions(topic: str, count: int, generate, avoid: list[str] | None = None) -> dict:
     """Write, check and shuffle questions. `generate` is the app's LLM function.
     A question is only returned if it passes the NBME-style checks, is grounded in the notes and
@@ -310,22 +386,61 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
     docs, metas, _ = search_notes(topic, n=8)
     if not docs:
         return {"items": [], "rejected": [], "lectures": []}
+    fixed = _fix_topic_spelling(topic, docs)
+    if fixed != topic:
+        print(f"Quiz: corrected the topic spelling {topic!r} -> {fixed!r}")
+        topic = fixed
+        docs, metas, _ = search_notes(topic, n=8) or (docs, metas, None)
 
     notes = "\n\n".join(f"[{m['source']}]\n{d}" for d, m in zip(docs, metas))
     lectures = list(dict.fromkeys(m["source"] for m in metas))
     rules = rule_excerpts()
     print(f"NBME excerpts used: {len(rules)} characters")
 
+    print(f"Quiz topic: {topic!r}; notes searched: {lectures}")
     accepted, rejected = [], []
     seen = {a.lower() for a in avoid}
-    for _ in range(max(2, -(-count // BATCH_SIZE) + 1)):  # small batches; extra rounds fill any gaps
+    empty_rounds = 0
+    t_start = time.time()
+    # Each round: several model calls run at the same time (each with a different angle so they
+    # don't repeat each other), then ONE check call reads all the candidates. Rounds repeat until we
+    # have enough, or two rounds in a row add nothing (the notes probably can't support more).
+    for round_no in range(MAX_ROUNDS):
         need = count - len(accepted)
-        if need <= 0:
+        if need <= 0 or empty_rounds >= 2:
             break
-        ask = min(need + 1, BATCH_SIZE + 1)
-        prompt = _build_prompt(topic, ask, notes, avoid + [q["stem"] for q in accepted], rules)
+        before = len(accepted)
+        total = need + 2  # two spares, since some will fail the checks
+        workers = max(1, min(PARALLEL_CALLS, total))
+        sizes = [total // workers + (1 if i < total % workers else 0) for i in range(workers)]
+        known = avoid + [q["stem"] for q in accepted]
+        prompts = []
+        for i, size in enumerate(sizes):
+            angle = ANGLES[(round_no * workers + i) % len(ANGLES)] if workers > 1 else ""
+            label = f"{topic} (this set: {angle})" if angle else topic
+            prompts.append(_build_prompt(label, size, notes, known, rules))
+
+        parsed_all, errors = [], []
+        if workers == 1:
+            try:
+                parsed_all.append(_write_batch(prompts[0], generate))
+            except Exception as e:
+                errors.append(e)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_write_batch, p, generate) for p in prompts]
+                for f in futures:
+                    try:
+                        parsed_all.append(f.result())
+                    except Exception as e:
+                        errors.append(e)
+        if errors and not any(parsed_all):
+            raise errors[0]  # every call failed: let the app report the AI service as unavailable
+        print(f"Quiz round {round_no + 1}: {workers} parallel call(s) done at {time.time() - t_start:.0f}s")
+
         candidates = []
-        for raw in _parse_items(generate(prompt)):
+        # interleave so each angle is represented before any one angle fills the list
+        for raw in [r for group in zip_longest(*parsed_all) for r in group if r]:
             item = _normalize(raw)
             if item is None:
                 rejected.append({"stem": str(raw.get("stem", ""))[:200], "problems": ["malformed item"]})
@@ -335,6 +450,9 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
                 problems.append("the correct answer is not supported by the notes")
             if item["stem"].lower() in seen:
                 problems.append("duplicate question")
+            if not problems and any(_same_answer(c["options"][c["answer"]], item["options"][item["answer"]])
+                                    for c in candidates + accepted):
+                problems.append("same correct answer as another question in this set")
             if problems:
                 rejected.append({"stem": item["stem"][:200], "problems": problems})
                 continue
@@ -342,18 +460,29 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
             if item["lecture"] not in lectures:
                 item["lecture"] = ""  # don't claim a source the model made up
             candidates.append(item)
-            if len(candidates) >= ask:  # one spare, in case the judge rejects one
+            if len(candidates) >= total:
                 break
-        for item, (problems, quote) in zip(candidates, _judge(candidates, notes, generate)):
-            answer_text = item["options"][item["answer"]].strip().lower()
-            if any(a["options"][a["answer"]].strip().lower() == answer_text for a in accepted):
-                problems = problems + ["same correct answer as another question in this set"]
-            if problems:
-                rejected.append({"stem": item["stem"][:200], "problems": problems})
-            else:
-                src = next((m["source"] for d, m in zip(docs, metas) if quote and _norm(quote)[:40] in _norm(d)), "")
-                item["evidence"] = f"[{src}] {quote}" if quote and src else (quote or _evidence(item, docs, metas))
-                accepted.append(_shuffle_options(item))
+
+        if candidates:
+            for item, (problems, quote) in zip(candidates, _judge(candidates, notes, generate)):
+                if problems:
+                    rejected.append({"stem": item["stem"][:200], "problems": problems})
+                elif len(accepted) >= count:
+                    continue  # already have enough; the rest were spares
+                else:
+                    src = next((m["source"] for d, m in zip(docs, metas) if quote and _norm(quote)[:40] in _norm(d)), "")
+                    item["evidence"] = f"[{src}] {quote}" if quote and src else (quote or _evidence(item, docs, metas))
+                    accepted.append(_shuffle_options(item))
+        print(f"Quiz round {round_no + 1}: {len(accepted)} of {count} accepted at {time.time() - t_start:.0f}s")
+        empty_rounds = empty_rounds + 1 if len(accepted) == before else 0
+    if len(accepted) < count:
+        print(f"Quiz: asked for {count}, only {len(accepted)} passed the checks.")
+    if rejected:
+        counts = {}
+        for r in rejected:
+            for p in r["problems"]:
+                counts[p] = counts.get(p, 0) + 1
+        print("Quiz rejections:", dict(sorted(counts.items(), key=lambda kv: -kv[1])[:5]))
     return {"items": accepted[:count], "rejected": rejected, "lectures": lectures}
 
 
@@ -484,7 +613,9 @@ _VOCAB = ["answers", "answer", "questions", "question", "options", "option", "ch
 _FILLER = set("""quiz quizzes question questions more another few some set sets with without answers answer
 options option choices me give make generate create write practice test on about the a an of and please
 multiple choice mcq mcqs exam but no new next again show reveal i want need can you could would like to
-for from my us one two three four five six seven eight nine ten some key keys""".split())
+for from my us one two three four five six seven eight nine ten some key keys
+exam nbme style problem problems ask get drill practise quizzes hard easy difficult tough basic simple short
+any all questions? of in is are be do does that this these those it its by at as""".split())
 
 _NEW = re.compile(
     r"\b(quiz me|test me|practice (questions?|quiz|test)|multiple[- ]choice|mcqs?|exam questions?|"
@@ -519,7 +650,7 @@ def fix_typos(text: str) -> str:
 def _topic(message: str, prev_text: str) -> str:
     left = [w for w in re.findall(r"[A-Za-z]+", message) if w.lower() not in _FILLER]
     if sum(len(w) for w in left) >= 4:
-        return message  # the message itself names the subject, e.g. "quiz me on the brachium"
+        return " ".join(left)  # only the subject words: "give me 5 quiz questions with answers on the brachium" -> "brachium"
     cleaned = re.sub(r"\*+|Question\s*\d+[.:)]|Answers?:", " ", prev_text).strip()
     return cleaned[:500] if cleaned else message  # same lectures as the quiz just shown
 
