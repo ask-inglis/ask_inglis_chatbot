@@ -6,7 +6,7 @@ const API_URL = (
 ).replace(/\/$/, "");
 
 const STORAGE_KEY = "askInglisConversations";
-const RETENTION_DAYS = 1;
+const RETENTION_DAYS = 30;
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60 * 1000;
 
