@@ -164,14 +164,32 @@ def _normalize(raw: dict) -> dict | None:
 
 
 def _parse_items(text: str) -> list[dict]:
+    text = re.sub(r"```(?:json)?", "", text or "")
     start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1:
-        return []
-    try:
-        data = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
-        return []
-    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+    if start != -1 and end != -1:
+        chunk = text[start:end + 1]
+        for candidate in (chunk, re.sub(r",\s*([\]}])", r"\1", chunk)):  # second try drops trailing commas
+            try:
+                data = json.loads(candidate, strict=False)  # strict=False allows raw line breaks inside strings
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, list):
+                return [d for d in data if isinstance(d, dict)]
+    # Last resort: pull out each complete {...} object, so one broken item doesn't lose the rest.
+    decoder, items, pos = json.JSONDecoder(strict=False), [], 0
+    while True:
+        i = text.find("{", pos)
+        if i == -1:
+            break
+        try:
+            obj, j = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            pos = i + 1
+            continue
+        if isinstance(obj, dict) and "stem" in obj:
+            items.append(obj)
+        pos = j
+    return items
 
 
 def _shuffle_options(item: dict) -> dict:
@@ -214,9 +232,11 @@ Item-writing rules (NBME style):
 - The correct answer must not be the longest option. Keep the correct answer short, and write every wrong option with about the same length and level of detail as the correct one. Do not repeat words from the question inside only the correct option.
 - Do not use absolute words such as always or never.
 - Do not include any fact that is not in the notes. The correct answer must be stated in the notes.
-- Use a short dissection-lab or clinical scenario when the notes support it.
-- "option_notes" must cover EVERY option, including the correct one, with one or two sentences each. For the correct option, say why it is right. For each wrong option, say why it is wrong AND the mix-up that makes a student pick it (for example, confusing two nerves, two levels or two attachments). Use only facts from the notes.
-- "study_tip" is one sentence on how a student can avoid this mistake next time (for example, which two structures to compare, or what pattern to practice), based on the notes.
+- Start at least half of the questions with a one- or two-sentence scenario (a patient's finding after an injury, or what a student sees in the dissection lab), then ask the question. The scenario may only use facts that follow from the notes, and every finding in it must point to the correct answer (for example, a deformity or gap in the right place). Write the rest as direct recall questions.
+- If the question names a joint, region or level, the correct answer and every option must belong to that exact joint, region or level. Do not ask for the "main" or "primary" action unless the correct one is among the options.
+- Use standard anatomical names only, and prefer the names the notes use. Never use a structure from another organ system or a distant body region as a filler option.
+- "option_notes" must cover EVERY option, including the correct one, with one short sentence each. For the correct option, say why it is right. For each wrong option, say what that structure really is or does AND the mix-up that makes a student pick it (for example, confusing two nerves, two levels or two attachments). Use only facts from the notes. Do not add details about position, level or neighbours unless the notes state them.
+- "study_tip" is one sentence on how a student can avoid this mistake next time (for example, which two structures to compare, or what pattern to practice), based on the notes. Do not invent mnemonics, rhymes or letter counts.
 - Wrong options must be plausible: structures from the same region or group that a student could genuinely confuse with the answer (neighbouring nerves, muscles of the same group, structures at the same level). Never use structures from unrelated regions just to fill the list.
 - Each option note must state the specific fact. Never write only "this is the correct answer" or "this is incorrect". Never write "the notes", "according to the notes" or "as stated". Every option note must be different.
 - Every option, right or wrong, must be a real anatomical structure, term, finding or sign that a student could meet in the course. Never invent a term to fill a slot, and never use a function or action as an option when the other options are structures.
@@ -264,14 +284,19 @@ def _judge(items: list[dict], notes: str, generate) -> list[tuple[list[str], str
     )
     prompt = f"""You are a strict anatomy examiner checking exam questions against course notes.
 For each question decide:
-- same_type: true only if every option is the same kind of thing (all nerves, all muscles, and so on)
-  and no option is an obviously impossible choice for the question.
+- same_type: true only if every option is the same kind of thing (all nerves, all muscles, and so on),
+  every option is a standard anatomical term (not an invented or unusual name), and no option is an
+  obviously impossible choice for the question (for example, a structure from another organ system).
 - stem_accurate: true only if the question is anatomically correct (for example, it does not give a muscle the wrong action)
-  and only ONE option can be defended as correct using the notes.
+  and only ONE option can be defended as correct using the notes. Also false if the correct answer does not happen at
+  the joint, region or level the question names, or if the question asks for the main or primary one and a better
+  answer is missing from the options. For a scenario question, also false if any finding in the scenario points to
+  a different structure or injury than the answer (for example, a gap or deformity in the wrong place).
 - answer_quote: copy ONE sentence or phrase, word for word, from the notes that states the correct answer.
   Use an empty string if the notes do not state it. Do not use outside knowledge.
 - contradicted: the letters of any note (including the correct option's) that says something the notes contradict
-  or do not support. Use [] if every note agrees with the notes.
+  or do not support. Also list any note that states an anatomical fact you know to be wrong (for example, calling
+  a distal part proximal), even if the notes are silent on it. Use [] if every note is correct and supported.
 Return ONLY a JSON array with one object per question, in order:
 {{"id": 0, "same_type": true, "stem_accurate": true, "answer_quote": "...", "contradicted": [], "issue": "short reason if anything is false"}}
 
@@ -471,6 +496,8 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
                     continue  # already have enough; the rest were spares
                 else:
                     src = next((m["source"] for d, m in zip(docs, metas) if quote and _norm(quote)[:40] in _norm(d)), "")
+                    if src:
+                        item["lecture"] = src  # the lecture where the supporting sentence was found, not the model's guess
                     item["evidence"] = f"[{src}] {quote}" if quote and src else (quote or _evidence(item, docs, metas))
                     accepted.append(_shuffle_options(item))
         print(f"Quiz round {round_no + 1}: {len(accepted)} of {count} accepted at {time.time() - t_start:.0f}s")
