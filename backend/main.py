@@ -62,6 +62,16 @@ from questions import (
 from retrieval import search_notes
 from protect import allowed_origins, rate_limit, daily_cap
 from cache import cache_get, cache_put, cache_clear
+from typos import build_vocabulary, correct_query
+from insights import (
+    load_insights,
+    mark_reviewed,
+    reviewed_lectures,
+    record_answer,
+    record_quiz_grade,
+    flush_usage,
+    build_report,
+)
 
 app = FastAPI(title="AskInglis Backend")
 
@@ -239,11 +249,26 @@ def _warm_up():
         print(f"Startup rebuild: {rebuild_from_backups()}")
         print(f"Image catalog: {rebuild_images()} images")
         print(f"NBME guide: {rebuild_guides()} chunks")
+        print(f"Insights: {load_insights()}")
+        print(f"Spelling vocabulary: {rebuild_vocabulary()} words")
     except Exception as e:
         print(f"Warm-up failed: {e}")
     finally:
         state["ready"] = True
         print(f"Warm-up finished in {time.time() - start:.0f}s")
+
+
+# "Compare the brachialis and the biceps", "difference between X and Y", "X vs Y"
+COMPARE_PATTERN = re.compile(r"\b(compare|comparison|differences?\s+(?:between|of)|versus|vs\.?)\b", re.I)
+
+
+def rebuild_vocabulary() -> int:
+    """Words from the notes, used to catch typos in a student's question."""
+    try:
+        return build_vocabulary(collection.get(include=["documents"])["documents"])
+    except Exception as e:
+        print(f"Spelling vocabulary failed: {e}")
+        return 0
 
 
 def require_ready():
@@ -282,6 +307,7 @@ class ChatResponse(BaseModel):
     lectures: list[str] = []
     images: list[dict] = []
     degraded: bool = False  # true when the AI was unavailable and note excerpts were returned
+    understood_as: str | None = None  # the question after obvious spelling fixes, when anything was fixed
 
 
 class FeedbackRequest(BaseModel):
@@ -441,6 +467,8 @@ def chat(request: ChatRequest, background: BackgroundTasks):
             used = list(dict.fromkeys(i["lecture"] for i in new_items if i["lecture"])) or batch["lectures"]
             quiz_reply = format_quiz_for(new_items, intent["with_answers"])
             if new_items:
+                record_answer(used, "quiz")
+            if new_items:
                 remember_quiz(quiz_reply, new_items)
                 remember_answer(quiz_reply, used)
             return ChatResponse(reply=quiz_reply, sources=[], lectures=used)
@@ -453,6 +481,7 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 picks = parse_picks(request.message, len(items))
                 if picks:
                     reply = grade_answers(items, picks)
+                    record_quiz_grade(items, picks)
             if reply:
                 quiz_lectures = list(dict.fromkeys(i["lecture"] for i in items if i["lecture"]))
                 remember_answer(reply, quiz_lectures)
@@ -484,9 +513,13 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         hit = cache_get(request.message)
         if hit:
             print(f"Cache hit after {time.time() - t0:.2f}s")
+            record_answer(hit.get("lectures", []), "chat")
             return ChatResponse(**hit)
 
-    query = standalone_question(request.message, request.history)
+    typed, fixes = correct_query(request.message)  # "brachilais" -> "brachialis", only when clearly a typo
+    if fixes:
+        print(f"Spelling fixed: {fixes}")
+    query = standalone_question(typed, request.history)
 
     docs, metas, dists = search_notes(query, n=4, ratio=RETRIEVAL_DISTANCE_RATIO)
     if dists:
@@ -513,10 +546,13 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         )
     else:
         body_rule = (
-            'Unless the question only asks for a name or a definition, end your answer with a section titled exactly '
+            'Unless the question only asks for a name or a definition, or is a general overview of a whole system '
+            "or topic (for example 'what does the digestive system do'), end your answer with a section titled exactly "
             '"**Body type note**" with 1 to 2 bullets. Say how the approach, landmarks, depth, or the structure\'s '
             "size and position typically vary between bodies (for example slender, obese, elderly, small or large "
             "frame, or common anatomical variants) and what that changes at the dissection table. "
+            "Only add the note when it is about a specific structure or region the question names, and leave it out "
+            "rather than write something generic. "
             'If the notes do not cover it, start that bullet with "General knowledge:". '
             "If a difference could mean an abnormality, say so and tell the student to check with their instructor."
         )
@@ -527,24 +563,44 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         'Use "General knowledge:" only for facts that are not in the notes.'
     )
 
+    if COMPARE_PATTERN.search(typed):
+        # A side-by-side table: students compare structures all the time (origin, nerve, action...)
+        format_rules = (
+            "- Start with one bold line that states the main difference.\n"
+            "- Then ONE markdown table. The first column is called Feature, then one column per structure (at most 3).\n"
+            "- Use 4 to 6 rows chosen from: Location, Origin, Insertion, Action, Nerve supply, Blood supply, "
+            "What to look for at the table. Use only rows the notes support.\n"
+            '- Keep every cell under 12 words. If the notes do not cover a cell, write "Not in the notes", or start '
+            'it with "General knowledge:" for a fact that is not in the notes.\n'
+            "- Put structure names in **bold**. After the table, add one bullet on how students mix them up.\n"
+            "- Do not add a Body type note unless the student asked about a body type."
+        )
+        if BODY_TYPE_PATTERN.search(student_text):
+            format_rules += f"\n- {body_rule}"
+    else:
+        format_rules = (
+            "- Start with one bold line that answers the question directly.\n"
+            '- Then give 3 to 6 short bullet points, each under 20 words. Use "-" for bullets.\n'
+            "- Put structure names in **bold**.\n"
+            "- Never write a paragraph longer than two sentences. Keep the main answer under 150 words unless the "
+            "student asks for more detail; the Body type note is extra.\n"
+            f"- {body_rule}"
+        )
+
     prompt = f"""You are a study assistant for UB Human Anatomy Laboratory students who are skimming at the dissection table.
 Use the notes below as your primary source. Each note excerpt starts with the lecture it came from, in [brackets].
 Don't contradict the notes. If the notes don't cover something, add a bullet that starts with "General knowledge:" and say so.
 Excerpts from files named "Class NN" are dissection guides. Use them for what to do at the table, and the lecture notes for the anatomy itself.
 
 FORMAT (very important):
-- Start with one bold line that answers the question directly.
-- Then give 3 to 6 short bullet points, each under 20 words. Use "-" for bullets.
-- Put structure names in **bold**.
-- Never write a paragraph longer than two sentences. Keep the main answer under 150 words unless the student asks for more detail; the Body type note is extra.
-- {body_rule}
+{format_rules}
 - If you are not confident about a specific difference, say so. If a difference could mean an abnormality, say that and tell the
   student to check with their instructor.
 
 Notes:
 {context}
 {history_block}
-Question: {request.message}
+Question: {typed}
 
 Answer:"""
 
@@ -575,6 +631,7 @@ Answer:"""
         reply = "- I couldn't generate an answer for that.\n- Please try rephrasing your question."
     else:
         remember_answer(reply, lectures)  # so a later "that's wrong" can name these lectures
+        record_answer(lectures, "dissection" if metas and metas[0].get("kind") == "guide" else "chat")
 
     if answered and images and IMAGES_IN_REPLY:
         top = images[0]
@@ -582,7 +639,10 @@ Answer:"""
         credit = top["attribution"] or top["source"]
         reply += f"\n\n![{alt}]({top['url']})\n\n*{credit} ({top['license']})*"
 
-    data = {"reply": reply, "sources": sources, "lectures": lectures, "images": images}
+    data = {
+        "reply": reply, "sources": sources, "lectures": lectures, "images": images,
+        "understood_as": typed if fixes else None,
+    }
     if cacheable and answered:
         cache_put(request.message, data)
     return ChatResponse(**data)
@@ -757,6 +817,26 @@ def resolve(feedback_id: str, req: ResolveRequest):
     return record
 
 
+# ---------- Instructor review badge and weekly report ----------
+
+@app.get("/reviewed", dependencies=[Depends(limit_images)])
+def reviewed():
+    """Which lectures the instructor has reviewed, and when. Shown as a badge next to the lecture name."""
+    return {"lectures": reviewed_lectures()}
+
+
+@app.get("/admin/report", dependencies=[Depends(require_admin)])
+def admin_report(weeks: int = 4):
+    """What students ask about and miss. Counts only, no student text."""
+    flush_usage()
+    return build_report(weeks)
+
+
+@app.on_event("shutdown")
+def save_usage_on_shutdown():
+    flush_usage()
+
+
 # ---------- Practice questions (Phase 2) ----------
 
 @app.post(
@@ -785,6 +865,9 @@ def admin_generate_questions(req: QuestionRequest):
 def ingest_note(note: IngestNoteRequest):
     result = ingest_text(note.filename, note.text)
     cache_clear()  # old answers may be based on the previous version of this note
+    if result.get("status") == "ingested":
+        mark_reviewed([note.filename])  # the review tool only sends finalized notes
+        threading.Thread(target=rebuild_vocabulary, daemon=True).start()
     return IngestNoteResponse(**result)
 
 
@@ -815,4 +898,5 @@ def delete_note(filename: str):
     remove_existing_chunks(safe_name)
     delete_from_github(safe_name)
     cache_clear()
+    threading.Thread(target=rebuild_vocabulary, daemon=True).start()
     return {"status": "deleted", "filename": safe_name}

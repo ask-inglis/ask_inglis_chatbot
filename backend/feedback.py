@@ -209,7 +209,15 @@ def resolve_feedback(feedback_id: str, decision: str, comment: str = "") -> dict
         return rec
 
     with _write_lock:
-        return _with_retry(update, f"Resolve {feedback_id}")
+        rec = _with_retry(update, f"Resolve {feedback_id}")
+    if rec and rec.get("decision") in ("note_fixed", "answer_was_correct"):
+        try:  # the instructor looked at this lecture: students see a "reviewed" badge
+            from insights import mark_reviewed
+
+            mark_reviewed(rec.get("lectures", []))
+        except Exception as e:
+            print(f"Could not mark lectures as reviewed: {e}")
+    return rec
 
 
 def _resolve_many(ids: list[str], decision: str, comment: str) -> int:
