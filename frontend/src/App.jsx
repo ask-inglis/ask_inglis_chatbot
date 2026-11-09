@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import "./GuidedStudy.css";
+import "./AnatomyTheme.css";
 
 const API_URL = (
   import.meta.env.VITE_BACKEND_URL || "http://localhost:8000"
@@ -13,15 +15,16 @@ const CHECK_INTERVAL_MS = 60 * 1000;
 // The three ways to use the assistant. Quiz and Dissection reuse the same /chat endpoint:
 // the mode only decides how the student's words are phrased for the backend.
 const MODES = [
-  { id: "ask", label: "Ask & Quiz", icon: "💬", placeholder: "Ask a question, or type “quiz me on the brachium”" },
-  { id: "dissect", label: "Dissection", icon: "🧰", placeholder: "Type a structure or region, e.g. the anterior triangle of the neck" },
+  { id: "ask", label: "Ask & Quiz", icon: "🧠", placeholder: "Ask a question, or type “quiz me on the brachium”" },
+  { id: "guided", label: "Guided", icon: "🧭", placeholder: "Ask a follow-up question" },
+  { id: "dissect", label: "Dissection", icon: "🦴", placeholder: "Type a structure or region, e.g. the anterior triangle of the neck" },
   { id: "images", label: "Diagrams", icon: "🖼️", placeholder: "" },
 ];
 
 const STARTERS = [
-  { mode: "ask", icon: "💬", title: "Explain a structure", text: "What does the biceps brachii do?" },
+  { mode: "ask", icon: "🫀", title: "Explain a structure", text: "What does the biceps brachii do?" },
   { mode: "ask", icon: "📝", title: "Quiz me", text: "Quiz me on the brachium" },
-  { mode: "dissect", icon: "🧰", title: "Dissection steps", text: "the anterior triangle of the neck" },
+  { mode: "dissect", icon: "🦴", title: "Dissection steps", text: "the anterior triangle of the neck" },
   { mode: "images", icon: "🖼️", title: "Find a diagram", text: "" },
 ];
 
@@ -682,6 +685,158 @@ function FormattedAnswer({ content }) {
   );
 }
 
+// ---------- Guided Study (region + topic + specimen -> one focused question) ----------
+
+const REGIONS = ["Head & Neck", "Thorax", "Abdomen", "Pelvis", "Upper Limb", "Lower Limb", "Back"];
+const TOPICS = ["Muscles & Functions", "Nerves & Blood Supply", "Dissection Landmarks", "Anatomical Relationships"];
+const SPECIMENS = ["Typical", "Thin", "Muscular", "Obese", "Elderly"];
+
+function buildStudyQuestion(region, topic, specimen) {
+  const questions = {
+    "Muscles & Functions":
+      `Explain the major muscles and their functions in the ${region}. Include important attachments and actions.`,
+    "Nerves & Blood Supply":
+      `Explain the major nerves and blood vessels in the ${region}, including the structures they supply and key anatomical relationships.`,
+    "Dissection Landmarks":
+      `Explain the important landmarks of the ${region} for a supervised anatomy lab. Include important neighboring structures.`,
+    "Anatomical Relationships":
+      `Explain the spatial relationships among the major anatomical structures in the ${region}.`,
+  };
+  const word = specimen.toLowerCase();
+  const article = /^[aeiou]/.test(word) ? "an" : "a";
+  const variation = specimen === "Typical" ? ""
+    : ` Then describe how the anatomy might appear in ${article} ${word} specimen, separating typical anatomy from possible variations. Start any part that is not in the notes with “General knowledge:”.`;
+  return `${questions[topic]}${variation} Use the course lecture notes as the primary reference. `
+    + "Explain clearly with headings and bullet points, and identify any details not covered by the notes.";
+}
+
+function GuidedStudySetup({ onStart, onFreeChat, disabled }) {
+  const [region, setRegion] = useState("");
+  const [topic, setTopic] = useState(TOPICS[0]);
+  const [specimen, setSpecimen] = useState(SPECIMENS[0]);
+
+  return (
+    <div className="study-setup">
+      <div className="study-eyebrow">GUIDED ANATOMY STUDY</div>
+      <h1>Build your study session</h1>
+      <p className="study-intro">Choose what you want to explore. Ask Inglis will prepare a focused question.</p>
+      <button type="button" className="study-change-mode" onClick={onFreeChat} disabled={disabled}>
+        ← Switch to free chat
+      </button>
+      <div className="study-form">
+        <div className="study-step">
+          <div className="study-step-heading"><span>01</span>Choose an anatomical region</div>
+          <div className="study-options study-regions">
+            {REGIONS.map((item) => (
+              <button key={item} type="button" aria-pressed={region === item} disabled={disabled}
+                className={`study-choice ${region === item ? "selected" : ""}`}
+                onClick={() => setRegion(item)}>{item}</button>
+            ))}
+          </div>
+        </div>
+        <div className="study-step">
+          <div className="study-step-heading"><span>02</span>Choose a learning topic</div>
+          <div className="study-options study-topics">
+            {TOPICS.map((item) => (
+              <button key={item} type="button" aria-pressed={topic === item} disabled={disabled}
+                className={`study-choice ${topic === item ? "selected" : ""}`}
+                onClick={() => setTopic(item)}>{item}</button>
+            ))}
+          </div>
+        </div>
+        <div className="study-step">
+          <label className="study-step-heading" htmlFor="study-specimen">
+            <span>03</span>Specimen characteristics<em>(optional)</em>
+          </label>
+          <select id="study-specimen" className="study-select" value={specimen} disabled={disabled}
+            onChange={(event) => setSpecimen(event.target.value)}>
+            {SPECIMENS.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </div>
+        <div className="study-preview">
+          <div className="study-preview-label">QUESTION PREVIEW</div>
+          <p>{region ? buildStudyQuestion(region, topic, specimen)
+            : "Select an anatomical region to preview your study question."}</p>
+        </div>
+        <button className="study-start" type="button" disabled={!region || disabled}
+          onClick={() => onStart({ region, topic, specimen })}>Start guided study →</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Anatomy look: logo mark (a stack of vertebrae) and the ECG line shown while thinking ----------
+
+function BrandMark({ size = 22 }) {
+  const bones = [
+    { y: 2.5, w: 9 }, { y: 9.2, w: 11 }, { y: 15.9, w: 13 }, { y: 22.6, w: 15 },
+  ];
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" role="img" aria-label="Spine logo" focusable="false">
+      {bones.map(({ y, w }) => (
+        <g key={y} fill="#f8f3e8">
+          <rect x={16 - w / 2} y={y} width={w} height="5.4" rx="2.4" />
+          <rect x={16 - w / 2 - 4.6} y={y + 1.5} width="5.4" height="2.4" rx="1.2" />
+          <rect x={16 + w / 2 - 0.8} y={y + 1.5} width="5.4" height="2.4" rx="1.2" />
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+function EcgLine() {
+  return (
+    <svg className="ecg" viewBox="0 0 64 20" aria-hidden="true" focusable="false">
+      <path d="M0 10 H18 L22 10 L26 2 L31 18 L35 10 H64" />
+    </svg>
+  );
+}
+
+// ---------- Conversation names: short, readable, cut at a word (never mid-word) ----------
+
+const SMALL_WORDS = new Set(["a", "an", "and", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "vs", "with"]);
+
+// The AI sometimes answers with a generic title like "Human Anatomy Study". Those say nothing, so we ignore them.
+const GENERIC_TITLE = /^(a |an |the )?((human )?anatomy( study| chat| question| session| assistant| help)?|study( chat| session)?|anatomy lab|new conversation|conversation|chat)$/i;
+const isGenericTitle = (t) => !t || GENERIC_TITLE.test(String(t).replace(/[….\s]+$/, "").trim());
+const nameOf = (item) => {
+  if (!isGenericTitle(item.title) && !/^Human Anatomy Stud/i.test(item.title)) return item.title;
+  const first = item.messages?.find((m) => m.role === "user");
+  return first ? smartTitle(first.content, first.mode) : "New conversation";
+};
+
+function smartTitle(text, mode) {
+  const original = String(text || "").replace(/\s+/g, " ").trim();
+  if (!original) return "New conversation";
+  const isQuiz = /\b(quiz|test)\s+me\b|\bmcqs?\b|\bpractice (questions|quiz)\b/i.test(original);
+  let t = original
+    .replace(/[?.!:;,]+$/, "")
+    .replace(/^(please|hey|hi)[,\s]+/i, "")
+    .replace(/^(can|could|would) you\s+(please\s+)?/i, "")
+    .replace(/^(quiz|test) me\s+(on|about)\s+/i, "")
+    .replace(/^(give me|make me|write)\s+(some\s+|\d+\s+)?(practice\s+)?(quiz\s+)?(questions|mcqs?)\s+(on|about)\s+/i, "")
+    .replace(/^(what|which|where|how|why|when)\s+(is|are|was|were|does|do|did|can|should)\s+/i, "")
+    .replace(/^(tell me|explain|describe|show me|give me|find me|find)\s+(about\s+)?/i, "")
+    .replace(/^(the|a|an)\s+/i, "")
+    .replace(/\s+(do|does|work|mean|connect to)$/i, "")
+    .replace(/[?.!:;,]+$/, "")
+    .trim();
+  if (!t) t = original;
+  t = t.split(" ").map((word, i) => {
+    if (word.length > 1 && word === word.toUpperCase()) return word;
+    const lower = word.toLowerCase();
+    return i > 0 && SMALL_WORDS.has(lower) ? lower : lower.charAt(0).toUpperCase() + lower.slice(1);
+  }).join(" ");
+  const prefix = mode === "dissect" ? "Dissect: " : mode === "images" ? "Diagram: " : isQuiz ? "Quiz: " : "";
+  const room = 34 - prefix.length;
+  if (t.length > room) {
+    const cut = t.slice(0, room + 1);
+    t = cut.slice(0, Math.max(cut.lastIndexOf(" "), 12)).replace(/[\s,;:(-]+$/, "");
+    t = t.replace(/(\s+(a|an|and|at|by|for|from|in|of|on|or|the|to|vs|with))+$/i, "") + "…";
+  }
+  return prefix + t;
+}
+
 export default function App() {
   const [conversations, setConversations] = useState(() => {
     const existing = readConversations();
@@ -791,6 +946,7 @@ export default function App() {
   const selectConversation = (id) => {
     // Viewing an old chat does not reset the seven-day countdown.
     setActiveId(id);
+    setMode((m) => (m === "guided" ? "ask" : m));
     setQuestion("");
     setEditingId(null);
     setError("");
@@ -818,30 +974,33 @@ export default function App() {
     setConversations((old) => old.map((item) => {
       if (item.id !== id) return item;
       const nextMessages = update(item.messages);
-      const firstQuestion = nextMessages.find((msg) => msg.role === "user")?.content;
+      const firstMessage = nextMessages.find((msg) => msg.role === "user");
+      const firstQuestion = firstMessage?.content;
       return {
         ...item,
         messages: nextMessages,
         title: item.title === "New conversation" && firstQuestion
-          ? firstQuestion.slice(0, 36) : item.title,
+          ? smartTitle(firstQuestion, firstMessage.mode) : item.title,
         lastUsedAt: Date.now(),
       };
     }));
   };
 
-  const generateTitle = async (conversationId, firstQuestion) => {
-    const fallbackTitle = firstQuestion.slice(0, 36);
+  const generateTitle = async (conversationId, firstQuestion, titleMode) => {
+    const fallbackTitle = smartTitle(firstQuestion, titleMode === "ask" ? undefined : titleMode);
+    const hint = titleMode === "dissect" ? "Dissection steps for: "
+      : titleMode === "images" ? "Diagram search: " : "";
     try {
       const response = await fetch(`${API_URL}/title`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: firstQuestion }),
+        body: JSON.stringify({ message: hint + firstQuestion }),
       });
       if (!response.ok) throw new Error(`Title request failed (${response.status})`);
       const data = await response.json();
       const title = typeof data.title === "string"
         ? data.title.trim().slice(0, 60) : "";
-      if (!title) return;
+      if (isGenericTitle(title) || /^Human Anatomy Stud/i.test(title)) return;
       setConversations((old) => old.map((item) =>
         item.id === conversationId &&
         item.messages[0]?.content === firstQuestion &&
@@ -853,9 +1012,10 @@ export default function App() {
     }
   };
 
-  const ask = async (overrideText, overrideMode) => {
+  const ask = async (overrideText, overrideMode, skipTitle = false) => {
     const text = (typeof overrideText === "string" ? overrideText : question).trim();
-    const activeMode = overrideMode || mode;
+    const picked = overrideMode || mode;
+    const activeMode = picked === "guided" ? "ask" : picked;
     if (!text || !current || loadingId) return;
     const payload = buildPayload(activeMode, text);
     setLoadingText(
@@ -876,7 +1036,7 @@ export default function App() {
       { id: crypto.randomUUID(), role: "user", content: text,
         mode: activeMode === "ask" ? undefined : activeMode },
     ]);
-    if (previous.length === 0) void generateTitle(conversationId, text);
+    if (previous.length === 0 && !skipTitle) void generateTitle(conversationId, text, activeMode);
     setQuestion("");
     setError("");
     setLoadingId(conversationId);
@@ -1021,6 +1181,21 @@ export default function App() {
     setQuestion(starter.text);
   };
 
+  // Guided tab on a chat that already has messages starts a fresh conversation.
+  const chooseMode = (id) => {
+    if (id === "guided" && messages.length > 0) newConversation();
+    setMode(id);
+  };
+
+  const startGuided = (options) => {
+    if (!current || loadingId) return;
+    const id = current.id;
+    setConversations((old) => old.map((item) => (item.id === id
+      ? { ...item, title: `${options.region}: ${options.topic}`, studyContext: options } : item)));
+    setMode("ask");
+    void ask(buildStudyQuestion(options.region, options.topic, options.specimen), "ask", true);
+  };
+
   const submitFeedback = async (message, rating, comment = "") => {
     if (message.feedback || feedbackPendingId) return;
     setFeedbackPendingId(message.id);
@@ -1054,7 +1229,7 @@ export default function App() {
     <div className="app-shell" data-printing={printIds ? "true" : undefined}>
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-symbol">✦</span>
+          <span className="brand-symbol"><BrandMark /></span>
           <span>Ask Inglis</span>
         </div>
         <button className="new-chat" type="button" onClick={newConversation}>
@@ -1065,11 +1240,11 @@ export default function App() {
           {conversations.map((item) => (
             <div className={`conversation-row ${item.id === current?.id ? "active" : ""}`} key={item.id}>
               <button className="conversation-select" type="button"
-                onClick={() => selectConversation(item.id)} title={item.title}>
-                {item.title}
+                onClick={() => selectConversation(item.id)} title={nameOf(item)}>
+                {nameOf(item)}
               </button>
               <button className="delete-chat" type="button" title="Delete conversation"
-                aria-label={`Delete ${item.title}`} onClick={() => deleteConversation(item.id)}>
+                aria-label={`Delete ${nameOf(item)}`} onClick={() => deleteConversation(item.id)}>
                 ×
               </button>
             </div>
@@ -1094,14 +1269,14 @@ export default function App() {
       </aside>
 
       <main className="chat-panel" style={{
-        backgroundImage: `linear-gradient(90deg, rgba(250,252,253,.88), rgba(250,252,253,.92)), url("${import.meta.env.BASE_URL}anatomy-background.webp")`,
+        backgroundImage: `linear-gradient(90deg, rgba(245,247,250,.88), rgba(245,247,250,.93)), url("${import.meta.env.BASE_URL}anatomy-background.webp")`,
       }}>
         <header className="topbar">
           <strong>Anatomy AI Study Assistant</strong>
           <div className="mode-switch" role="tablist" aria-label="Mode">
             {MODES.map((m) => (
               <button type="button" role="tab" key={m.id} aria-selected={mode === m.id}
-                className={mode === m.id ? "active" : ""} onClick={() => setMode(m.id)}>
+                className={mode === m.id ? "active" : ""} onClick={() => chooseMode(m.id)}>
                 <span aria-hidden="true">{m.icon}</span> {m.label}
               </button>
             ))}
@@ -1116,9 +1291,14 @@ export default function App() {
             <strong>Ask Inglis study sheet</strong>
             <span>{new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}</span>
           </div>
-          {messages.length === 0 && (
+          {messages.length === 0 && mode === "guided" && (
+            <GuidedStudySetup onStart={startGuided} onFreeChat={() => setMode("ask")}
+              disabled={Boolean(loadingId)} />
+          )}
+          {messages.length === 0 && mode !== "guided" && (
             <div className="welcome">
-              <div className="welcome-emblem">✦</div>
+              <div className="welcome-emblem"><BrandMark size={44} /></div>
+              <div className="plate-label">Human anatomy study</div>
               <h1>What would you like to learn?</h1>
               <p>Ask a question, get quizzed, or get dissection steps. Every answer comes from Dr. Inglis's lecture notes.</p>
               <div className="starters">
@@ -1130,6 +1310,17 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              <button type="button" className="study-change-mode" onClick={() => chooseMode("guided")}>
+                🧭 Try guided study instead →
+              </button>
+            </div>
+          )}
+          {current?.studyContext && messages.length > 0 && (
+            <div className="study-context-bar">
+              <span>🧭 Guided study</span>
+              <span>{current.studyContext.region}</span>
+              <span>{current.studyContext.topic}</span>
+              {current.studyContext.specimen !== "Typical" && <span>{current.studyContext.specimen} specimen</span>}
             </div>
           )}
           {messages.map((message, index) => {
@@ -1235,13 +1426,14 @@ export default function App() {
             <div className="message-row">
               <article className="message assistant-message">
                 <div className="message-author">Ask Inglis</div>
-                <span className="thinking">{loadingText}</span>
+                <span className="thinking"><EcgLine />{loadingText}</span>
               </article>
             </div>
           )}
           {error && <div className="chat-error" role="alert">{error}</div>}
           <div ref={messagesEndRef} />
         </section>
+        {!(mode === "guided" && messages.length === 0) && (
         <div className="composer-area">
           {undo && (
             <div className="edit-banner" role="status">
@@ -1302,6 +1494,7 @@ export default function App() {
           </div>
           <small>Enter to send · Shift + Enter for a new line</small>
         </div>
+        )}
         </>)}
       </main>
 

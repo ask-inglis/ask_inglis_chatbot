@@ -790,7 +790,9 @@ button {
   .topbar { padding: 12px 14px; }
   .topbar .grounded { display: none; }
   .mode-switch { width: 100%; }
-  .mode-switch button { flex: 1; padding: 8px 6px; }
+  .mode-switch button { flex: 1; padding: 8px 4px; font-size: 12.5px; white-space: nowrap; }
+  .mode-switch button span[aria-hidden="true"] { display: none; }
+  .mode-switch { flex-wrap: wrap; border-radius: 18px; }
   .starters { grid-template-columns: 1fr; }
   .messages { padding: 18px 12px 20px; }
   .quiz-actions button { flex: 1; }

@@ -1,0 +1,328 @@
+/* Anatomy theme: clean medical look: white, slate and one muted red.
+   
+   This file only restyles. Load it after App.css and GuidedStudy.css. */
+
+:root {
+  --ink: #1f2933;
+  --ink-2: #34475a;
+  --bone: #f4f7fa;
+  --parch: #f5f7fa;
+  --card: #ffffff;
+  --line: #e1e7ee;
+  --line-2: #cfd8e2;
+  --artery: #b04a4f;
+  --artery-dark: #8a3438;
+  --artery-soft: #fbeeee;
+  --nerve: #8fa3b8;
+  --nerve-soft: #eef2f6;
+  --vein: #5b7a99;
+  --text: #27323d;
+  --muted: #66727f;
+  --serif: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, "Times New Roman", serif;
+}
+
+body { background: var(--parch); color: var(--text); }
+
+/* A thin artery / nerve / vein strip across the top of the chat panel */
+.chat-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 4px;
+  z-index: 6;
+  background: linear-gradient(90deg, var(--artery) 0 38%, var(--vein) 38% 100%);
+}
+
+/* ---------- Sidebar ---------- */
+
+.sidebar {
+  background: linear-gradient(180deg, #2a3b4d 0%, #223140 100%);
+  color: var(--bone);
+  border-right: 1px solid #1a2633;
+}
+
+.brand { font-family: var(--serif); font-weight: 700; letter-spacing: .01em; }
+
+.brand-symbol {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  background: var(--artery);
+  border-radius: 12px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .18), 0 3px 10px rgba(0, 0, 0, .25);
+}
+
+.new-chat {
+  background: rgba(244, 247, 250, .06);
+  border: 1px solid rgba(143, 163, 184, .55);
+  color: var(--bone);
+}
+
+.new-chat:hover,
+.conversation-row:hover { background: rgba(244, 247, 250, .13); }
+
+.sidebar-label { color: #aebccb; }
+
+.conversation-row.active {
+  background: rgba(143, 163, 184, .16);
+  box-shadow: inset 3px 0 0 var(--nerve);
+}
+
+.conversation-select { color: #eef2f6; }
+.retention-note { border-top: 1px dashed rgba(174, 188, 203, .35); color: #9fb0c1; }
+.missed button b { color: var(--nerve); }
+
+/* ---------- Panel, top bar, tabs ---------- */
+
+.chat-panel { background-color: var(--parch); }
+
+.topbar {
+  background: rgba(255, 255, 255, .86);
+  border-bottom: 1px solid var(--line);
+  padding-top: 19px;
+}
+
+.topbar strong { font-family: var(--serif); font-size: 18px; letter-spacing: .01em; }
+.topbar span { color: var(--muted); }
+
+.mode-switch { background: #e8edf3; border-color: var(--line-2); }
+.mode-switch button { color: #55626f; }
+.mode-switch button:hover { background: rgba(255, 255, 255, .7); }
+.mode-switch button.active { color: var(--artery-dark); background: var(--card); box-shadow: 0 1px 5px rgba(30, 50, 70, .18); }
+
+.mode-switch button:focus-visible,
+.starter:focus-visible,
+.chips button:focus-visible,
+.quiz-option:focus-visible { outline-color: var(--artery); }
+
+/* ---------- Welcome ---------- */
+
+.welcome-emblem {
+  display: inline-grid;
+  place-items: center;
+  width: 78px;
+  height: 78px;
+  padding: 0;
+  background: var(--artery);
+  border: 0;
+  border-radius: 24px;
+  box-shadow: 0 10px 28px rgba(138, 52, 56, .3), inset 0 0 0 1px rgba(255, 255, 255, .2);
+}
+
+.plate-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin: 18px 0 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: var(--artery-dark);
+}
+
+.plate-label::before,
+.plate-label::after {
+  content: "";
+  width: 56px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--artery));
+}
+
+.plate-label::after { transform: scaleX(-1); }
+
+.welcome h1 { font-family: var(--serif); font-weight: 700; color: var(--ink); }
+.welcome p { color: var(--muted); }
+
+.starter {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 2px 0 var(--line), 0 6px 16px rgba(30, 50, 70, .06);
+}
+
+.starter:hover {
+  border-color: var(--artery);
+  box-shadow: 0 2px 0 var(--artery), 0 10px 22px rgba(138, 52, 56, .12);
+}
+
+.starter strong { font-family: var(--serif); font-size: 16px; color: var(--ink); }
+.starter small { color: var(--muted); }
+
+/* ---------- Messages ---------- */
+
+.user-message { background: #e9eef4; border: 1px solid var(--line-2); border-radius: 16px; }
+
+.assistant-message {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--artery);
+  border-radius: 6px 16px 16px 6px;
+  box-shadow: 0 3px 16px rgba(30, 50, 70, .07);
+}
+
+.message-author {
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--artery-dark);
+}
+
+.user-message .message-author { color: #55626f; }
+
+.formatted-answer h3 {
+  font-family: var(--serif);
+  font-size: 17px;
+  color: var(--ink);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.formatted-answer strong { color: var(--artery-dark); }
+.formatted-answer li::marker { color: var(--artery); }
+.formatted-answer code { background: #edf1f6; color: #3f4c59; }
+
+.mode-badge { color: var(--artery-dark); background: var(--artery-soft); border-color: #ecc9cb; }
+.understood { color: #55626f; background: #eef2f6; }
+
+.body-note { background: #f1f5f9; border: 1px solid var(--line); border-left: 4px solid var(--nerve); }
+.body-note summary { color: #44566a; }
+
+/* Source chips look like specimen tags with a punched hole */
+.source-chip {
+  position: relative;
+  padding: 5px 11px 5px 24px;
+  color: #3f5266;
+  background: #e6edf4;
+  border: 1px solid #c9d6e3;
+  border-radius: 4px 14px 14px 4px;
+}
+
+.source-chip::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -3.5px;
+  border-radius: 50%;
+  background: var(--card);
+  box-shadow: inset 0 0 0 1.5px #8fa3b8;
+}
+
+.sources { border-top: 1px dashed var(--line-2); }
+.sources b { color: var(--muted); }
+
+.source-passages { background: #f4f7fa; border-color: var(--line); }
+.source-passages blockquote { border-left-color: var(--nerve); color: #3f4c59; }
+.reviewed-line { color: #2f6b3f; }
+
+.feedback-actions button { background: #f1f5f9; border-color: var(--line); }
+.chips button { color: var(--artery-dark); background: #fbeeee; border-color: #ecccce; }
+.chips button:hover { background: #f6dfe0; border-color: #dba9ac; }
+.edit-btn { color: #55626f; border-color: var(--line-2); background: var(--card); }
+.edit-btn:hover { background: #eef2f6; }
+.hint-row button { color: var(--artery-dark); background: #fbeeee; border-color: #ecccce; }
+.hint-row button:hover { background: #f6dfe0; }
+.edit-banner { color: #55626f; background: #eef2f6; border-color: var(--line-2); }
+.edit-banner button { color: #55626f; border-color: var(--line-2); }
+.context-line span { color: var(--muted); }
+
+/* ECG line while the assistant is thinking */
+.thinking { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); }
+
+.ecg { width: 64px; height: 20px; flex: none; }
+.ecg path { fill: none; stroke: var(--artery); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: 70 110; animation: ecg-run 1.6s linear infinite; }
+
+@keyframes ecg-run { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -180; } }
+
+@media (prefers-reduced-motion: reduce) { .ecg path { animation: none; stroke-dasharray: none; } }
+
+/* ---------- Quiz, steps, figures ---------- */
+
+.quiz-q { background: var(--card); border: 1px solid var(--line); border-top: 3px solid var(--artery); }
+.quiz-q legend { color: var(--artery-dark); letter-spacing: .1em; }
+.quiz-option { border-color: var(--line-2); background: #ffffff; }
+.quiz-option:hover:not(:disabled) { border-color: var(--artery); background: #fdf5f5; }
+.quiz-option.selected { border-color: var(--artery); background: var(--artery-soft); box-shadow: inset 0 0 0 1px var(--artery); }
+.quiz-letter { color: #55626f; background: #e6ecf2; }
+.quiz-option.selected .quiz-letter { color: #fff; background: var(--artery); }
+.quiz-actions span { color: var(--muted); }
+.quiz-actions button { color: #55626f; border-color: var(--line-2); background: var(--card); }
+.quiz-actions button.primary,
+.step-actions button.primary { color: #fff; background: var(--artery); border-color: var(--artery); }
+
+.step-card { background: #f4f7fa; border: 1px solid var(--line); border-left: 4px solid var(--nerve); }
+.step-count { color: var(--artery-dark); }
+.step-bar { background: #dde5ed; }
+.step-bar span { background: var(--artery); }
+.step-actions button { color: #55626f; border-color: var(--line-2); background: var(--card); }
+.step-link { color: var(--artery-dark); }
+.view-switch button.active { color: #fff; background: var(--artery); }
+
+/* Figures are framed like atlas plates */
+.figure {
+  background: var(--card);
+  border: 1px solid var(--line-2);
+  box-shadow: 0 0 0 4px var(--card), 0 0 0 5px var(--line-2), 0 8px 22px rgba(30, 50, 70, .1);
+  border-radius: 4px;
+  margin: 18px 5px 10px;
+}
+
+.figure img { background: #f5f7fa; }
+.figure figcaption span { color: var(--muted); }
+.figure figcaption a { color: var(--vein); }
+
+.diagrams-inner h1 { font-family: var(--serif); color: var(--ink); }
+
+/* ---------- Composer ---------- */
+
+.composer-area { background: linear-gradient(0deg, rgba(245, 247, 250, .98) 70%, rgba(245, 247, 250, 0)); }
+.composer { background: var(--card); border: 1px solid var(--line-2); box-shadow: 0 6px 26px rgba(30, 50, 70, .12); }
+.composer:focus-within { border-color: var(--artery); box-shadow: 0 6px 26px rgba(138, 52, 56, .16); }
+
+.send-button, .primary { background: var(--artery); }
+.send-button:hover:not(:disabled), .primary:hover:not(:disabled) { background: var(--artery-dark); }
+.mic-button { background: #eef2f6; border-color: var(--line-2); }
+.mic-button:hover:not(:disabled) { background: #dde5ed; }
+.composer-area small { color: #7f8b97; }
+
+.modal { background: var(--card); }
+.modal h2 { font-family: var(--serif); }
+
+/* ---------- Guided study, recolored ---------- */
+
+.study-eyebrow { color: var(--artery-dark); }
+.study-setup h1 { font-family: var(--serif); color: var(--ink); }
+.study-intro { color: var(--muted); }
+.study-form { background: var(--card); border-color: var(--line); box-shadow: 0 6px 26px rgba(30, 50, 70, .09); border-top: 3px solid var(--artery); }
+.study-step-heading > span { background: var(--artery-soft); color: var(--artery-dark); }
+.study-choice { background: #ffffff; border-color: var(--line-2); color: #2f3b47; }
+.study-choice:hover:enabled { border-color: var(--artery); background: #fdf5f5; }
+.study-choice.selected { background: var(--artery-soft); border-color: var(--artery); color: var(--artery-dark); box-shadow: inset 0 0 0 1px var(--artery); }
+.study-select { background: #ffffff; border-color: var(--line-2); color: #2f3b47; }
+.study-preview { background: #f4f7fa; border-color: var(--line); }
+.study-preview-label { color: var(--artery-dark); }
+.study-preview p { color: #2f3b47; }
+.study-start { background: var(--artery); }
+.study-start:hover:enabled { background: var(--artery-dark); }
+.study-change-mode { color: var(--artery-dark); border-color: var(--line-2); background: rgba(255, 255, 255, .8); }
+.study-context-bar span { color: var(--artery-dark); background: #fbeeee; border-color: #ecccce; }
+
+.study-choice:focus-visible,
+.study-select:focus-visible,
+.study-start:focus-visible,
+.study-change-mode:focus-visible { outline-color: var(--artery); }
+
+@media print {
+  .chat-panel::before { display: none; }
+  .assistant-message { border-left-width: 3px; box-shadow: none; }
+  .source-chip::before { display: none; }
+  .source-chip { padding-left: 11px; }
+}

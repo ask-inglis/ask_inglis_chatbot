@@ -666,7 +666,9 @@ def conversation_title(req: TitleRequest):
     """Short title for a conversation, from the first question. Never fails: if the model is
     unavailable, the title is the first few words of the question."""
     fallback = req.message.strip()
-    prompt = f"""Write a short title (3 to 6 words) for a student's study chat about human anatomy.
+    prompt = f"""Write a short title (2 to 5 words) naming the specific topic of this student's first message.
+Use the actual structure, region or task (for example "Biceps Brachii Function", "Brachium Quiz", "Anterior Neck Triangle").
+Never use generic titles such as "Human Anatomy Study", "Anatomy Chat" or "Study Session".
 Use title case. No quotes, no ending punctuation, no emoji. Return only the title.
 
 Student's first question: {req.message[:500]}
