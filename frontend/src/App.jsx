@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import "./App.css";
 import "./GuidedStudy.css";
 import "./AnatomyTheme.css";
@@ -12,20 +13,12 @@ const RETENTION_DAYS = 30;
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60 * 1000;
 
-// The three ways to use the assistant. Quiz and Dissection reuse the same /chat endpoint:
+// The ways to use the assistant. Quiz reuses the same /chat endpoint; the lab bench is a side panel:
 // the mode only decides how the student's words are phrased for the backend.
 const MODES = [
   { id: "ask", label: "Ask & Quiz", icon: "🧠", placeholder: "Ask a question, or type “quiz me on the brachium”" },
   { id: "guided", label: "Guided", icon: "🧭", placeholder: "Ask a follow-up question" },
-  { id: "dissect", label: "Dissection", icon: "🦴", placeholder: "Type a structure or region, e.g. the anterior triangle of the neck" },
   { id: "images", label: "Diagrams", icon: "🖼️", placeholder: "" },
-];
-
-const STARTERS = [
-  { mode: "ask", icon: "🫀", title: "Explain a structure", text: "What does the biceps brachii do?" },
-  { mode: "ask", icon: "📝", title: "Quiz me", text: "Quiz me on the brachium" },
-  { mode: "dissect", icon: "🦴", title: "Dissection steps", text: "the anterior triangle of the neck" },
-  { mode: "images", icon: "🖼️", title: "Find a diagram", text: "" },
 ];
 
 const CONTEXT_MESSAGES = 6;
@@ -151,17 +144,17 @@ function formatInline(text) {
     });
 }
 
-const SpeechRec = typeof window !== "undefined"
-  ? (window.SpeechRecognition || window.webkitSpeechRecognition)
-  : undefined;
-const CAN_SPEAK = typeof window !== "undefined" && "speechSynthesis" in window;
+// Read-aloud text for an ordinary answer: no markdown symbols, no tables.
+const speakableText = (content) => String(content || "")
+  .split("\n")
+  .filter((l) => !/^\s*\|/.test(l))
+  .map((l) => l.replace(/^\s*#{1,4}\s+/, "").replace(/^\s*[-*•]\s+/, "").replace(/^\s*\d+[.)]\s+/, "").replace(/[*_`]/g, "").trim())
+  .filter(Boolean)
+  .join(". ")
+  .replace(/\.\s*\./g, ".")
+  .slice(0, 4000);
 
-function speakableText(markdown) {
-  return String(markdown || "")
-    .replace(/[*`#]/g, "")
-    .replace(/^\s*[-•]\s+/gm, "")
-    .replace(/\n+/g, ". ");
-}
+const CAN_SPEAK = typeof window !== "undefined" && "speechSynthesis" in window;
 
 const GK = /^general knowledge:\s*/i;
 
@@ -301,6 +294,41 @@ function splitSteps(content) {
   };
 }
 
+// Layered guide: numbered steps, each followed by "You should see / Do not cut / Can't find it?" lines
+const NUMBERED = /^\s{0,3}\d+[.)]\s+/;
+const EXTRA = /^\s*(?:[-*•]\s*)?\**\s*(you should see|see|do not cut|careful|can['’]t find it|stuck)\s*\**\s*[:?]\s*\**\s*(.*)$/i;
+
+function splitLayered(content) {
+  const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  const steps = [];
+  const extras = [];
+  let first = -1;
+  let last = -1;
+  lines.forEach((line, i) => {
+    if (NUMBERED.test(line)) {
+      steps.push(line.replace(NUMBERED, "").trim());
+      extras.push({});
+      if (first < 0) first = i;
+      last = i;
+      return;
+    }
+    if (!steps.length) return;
+    const m = EXTRA.exec(line);
+    if (!m || !m[2].trim()) return;
+    const label = m[1].toLowerCase();
+    const key = label.includes("see") ? "see" : /cut|careful/.test(label) ? "careful" : "stuck";
+    extras[extras.length - 1][key] = m[2].trim().replace(/\*+$/, "");
+    last = i;
+  });
+  if (steps.length < 3 || !extras.some((e) => e.see || e.careful || e.stuck)) return null;
+  return {
+    head: lines.slice(0, first).join("\n").trim(),
+    steps,
+    extras,
+    tail: lines.slice(last + 1).join("\n").trim(),
+  };
+}
+
 const CHECKS_KEY = "askInglisChecks";
 
 function readChecks() {
@@ -332,7 +360,7 @@ function formatClock(total) {
 }
 
 function StepViewer({ content, messageId }) {
-  const parts = useMemo(() => splitSteps(content), [content]);
+  const parts = useMemo(() => splitLayered(content) || splitSteps(content), [content]);
   const [index, setIndex] = useState(0);
   const [showAll, setShowAll] = useState(false);
   const [speaking, setSpeaking] = useState(false);
@@ -363,7 +391,8 @@ function StepViewer({ content, messageId }) {
     );
   }
 
-  const { head, steps, tail } = parts;
+  const { head, steps, tail, extras } = parts;
+  const extra = extras?.[index];
   const toggleStep = (i) => {
     const next = done.includes(i) ? done.filter((n) => n !== i) : [...done, i];
     setDone(next);
@@ -374,7 +403,7 @@ function StepViewer({ content, messageId }) {
   const go = (next) => { stop(); setIndex(Math.max(0, Math.min(steps.length - 1, next))); };
   const speak = () => {
     if (speaking) { stop(); return; }
-    const text = `Step ${index + 1}. ${steps[index].replace(/[*`]/g, "")}`;
+    const text = `Step ${index + 1}. ${steps[index].replace(/[*`]/g, "")}${extra?.see ? ` You should see: ${extra.see.replace(/[*`]/g, "")}` : ""}`;
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.onend = () => setSpeaking(false);
     utterance.onerror = () => setSpeaking(false);
@@ -434,6 +463,13 @@ function StepViewer({ content, messageId }) {
         <div className="step-count">Step {index + 1} of {steps.length}</div>
         <div className="step-bar"><span style={{ width: `${((index + 1) / steps.length) * 100}%` }} /></div>
         <p className="step-text">{formatInline(steps[index])}</p>
+        {extra && (extra.see || extra.careful || extra.stuck) && (
+          <div className="step-extras">
+            {extra.see && <div className="step-extra see"><b>👁 You should see</b><span>{formatInline(extra.see)}</span></div>}
+            {extra.careful && <div className="step-extra careful"><b>⛔ Do not cut</b><span>{formatInline(extra.careful)}</span></div>}
+            {extra.stuck && <div className="step-extra stuck"><b>🔎 Can’t find it?</b><span>{formatInline(extra.stuck)}</span></div>}
+          </div>
+        )}
       </div>
       <div className="step-actions">
         <button type="button" disabled={index === 0} onClick={() => go(index - 1)}>← Back</button>
@@ -508,11 +544,19 @@ function DiagramsTab({ onAsk }) {
   );
 }
 
+const CONFIDENCE = [
+  { id: "sure", label: "Sure" },
+  { id: "unsure", label: "Not sure" },
+  { id: "guess", label: "Guessing" },
+];
+
 function QuizCards({ items, locked, onSubmit, onShowAnswers }) {
   const [picks, setPicks] = useState({});
+  const [sureness, setSureness] = useState({});
   const answered = Object.keys(picks).length;
   const submit = () => onSubmit(
-    items.filter((q) => picks[q.num]).map((q) => `${q.num}${picks[q.num]}`).join(" ")
+    items.filter((q) => picks[q.num]).map((q) => `${q.num}${picks[q.num]}`).join(" "),
+    Object.fromEntries(items.filter((q) => picks[q.num]).map((q) => [q.num, sureness[q.num] || "unsure"]))
   );
   return (
     <div className="quiz">
@@ -530,6 +574,16 @@ function QuizCards({ items, locked, onSubmit, onShowAnswers }) {
               </button>
             ))}
           </div>
+          {picks[q.num] && (
+            <div className="quiz-sure" role="group" aria-label={`How sure are you about question ${q.num}?`}>
+              <span>How sure are you?</span>
+              {CONFIDENCE.map((c) => (
+                <button type="button" key={c.id} aria-pressed={sureness[q.num] === c.id}
+                  className={`sure-chip ${sureness[q.num] === c.id ? "on" : ""}`}
+                  onClick={() => setSureness((old) => ({ ...old, [q.num]: c.id }))}>{c.label}</button>
+              ))}
+            </div>
+          )}
         </fieldset>
       ))}
       <div className="quiz-actions">
@@ -542,6 +596,36 @@ function QuizCards({ items, locked, onSubmit, onShowAnswers }) {
     </div>
   );
 }
+
+// After grading: right/wrong crossed with how sure the student said they were.
+function GradeBreakdown({ reply, confidence }) {
+  if (!confidence) return null;
+  const rows = [...String(reply).matchAll(/\*\*Question (\d+): (Correct|Not quite|Not answered)/g)]
+    .map((m) => ({ num: Number(m[1]), right: m[2] === "Correct", sure: confidence[m[1]] === "sure" }));
+  if (!rows.length) return null;
+  const nums = (list) => list.map((r) => r.num);
+  const groups = [
+    { key: "gap", tone: "bad", title: "Confident but wrong", hint: "Study these first. You thought you knew them.", list: rows.filter((r) => !r.right && r.sure) },
+    { key: "work", tone: "warn", title: "Wrong, and you were unsure", hint: "You already sensed these were weak.", list: rows.filter((r) => !r.right && !r.sure) },
+    { key: "shaky", tone: "info", title: "Right, but not sure", hint: "Review once so it sticks.", list: rows.filter((r) => r.right && !r.sure) },
+    { key: "solid", tone: "good", title: "Solid", hint: "Right, and you were sure.", list: rows.filter((r) => r.right && r.sure) },
+  ].filter((g) => g.list.length);
+  return (
+    <div className="grade-breakdown" aria-label="How sure you were, compared with your score">
+      <strong>Where to focus</strong>
+      {groups.map((g) => (
+        <div key={g.key} className={`grade-row ${g.tone}`}>
+          <span className="grade-title">{g.title}</span>
+          <span className="grade-qs">{nums(g.list).map((n) => `Q${n}`).join(", ")}</span>
+          <span className="grade-hint">{g.hint}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Make the "why you chose that" paragraph stand out from the rest of the explanation.
+const highlightChoice = (text) => String(text || "").replace(/^You chose \*\*(.+?)\*\*\.\s*/gm, "**Why you chose “$1”:** ");
 
 function FormattedAnswer({ content }) {
   const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
@@ -705,9 +789,23 @@ function buildStudyQuestion(region, topic, specimen) {
   const word = specimen.toLowerCase();
   const article = /^[aeiou]/.test(word) ? "an" : "a";
   const variation = specimen === "Typical" ? ""
-    : ` Then describe how the anatomy might appear in ${article} ${word} specimen, separating typical anatomy from possible variations. Start any part that is not in the notes with “General knowledge:”.`;
+    : ` Then describe how the anatomy might appear in ${article} ${word} specimen, separating typical anatomy from possible variations.`;
   return `${questions[topic]}${variation} Use the course lecture notes as the primary reference. `
-    + "Explain clearly with headings and bullet points, and identify any details not covered by the notes.";
+    + "Explain clearly with headings and bullet points. Start any part that is not in the notes with “General knowledge:”.";
+}
+
+// What the student sees: a plain question, not the instructions sent to the model.
+function studyLine(region, topic, specimen) {
+  const area = region === "Head & Neck" ? "head and neck" : region.toLowerCase();
+  const lines = {
+    "Muscles & Functions": `What are the major muscles of the ${area}, what do they attach to, and what do they do?`,
+    "Nerves & Blood Supply": `Which nerves and blood vessels run through the ${area}, and what do they supply?`,
+    "Dissection Landmarks": `Which landmarks should I find in the ${area} during the lab, and what lies next to each?`,
+    "Anatomical Relationships": `How are the main structures of the ${area} arranged relative to each other?`,
+  };
+  const word = specimen.toLowerCase();
+  const extra = specimen === "Typical" ? "" : ` Also show how ${/^[aeiou]/.test(word) ? "an" : "a"} ${word} specimen may differ.`;
+  return `${lines[topic]}${extra}`;
 }
 
 function GuidedStudySetup({ onStart, onFreeChat, disabled }) {
@@ -754,8 +852,8 @@ function GuidedStudySetup({ onStart, onFreeChat, disabled }) {
           </select>
         </div>
         <div className="study-preview">
-          <div className="study-preview-label">QUESTION PREVIEW</div>
-          <p>{region ? buildStudyQuestion(region, topic, specimen)
+          <div className="study-preview-label">YOUR QUESTION</div>
+          <p>{region ? studyLine(region, topic, specimen)
             : "Select an anatomical region to preview your study question."}</p>
         </div>
         <button className="study-start" type="button" disabled={!region || disabled}
@@ -808,6 +906,12 @@ const nameOf = (item) => {
 function smartTitle(text, mode) {
   const original = String(text || "").replace(/\s+/g, " ").trim();
   if (!original) return "New conversation";
+  if (mode === "locate") {
+    const region = original.match(/dissecting the ([^.]+)\./i)?.[1];
+    const seen = original.replace(/^.*?what i can see:\s*/i, "").replace(/\.?\s*where am i.*$/i, "");
+    const label = region ? region.replace(/\b\w/g, (c) => c.toUpperCase()) : seen.split(" ").slice(0, 4).join(" ");
+    return `Where am I: ${label}`.slice(0, 34);
+  }
   const isQuiz = /\b(quiz|test)\s+me\b|\bmcqs?\b|\bpractice (questions|quiz)\b/i.test(original);
   let t = original
     .replace(/[?.!:;,]+$/, "")
@@ -837,6 +941,433 @@ function smartTitle(text, mode) {
   return prefix + t;
 }
 
+// ---------- Where am I?: describe what you see in words. Text only, never photos. ----------
+
+function WhereAmI({ busy, onSubmit, onClose }) {
+  const [region, setRegion] = useState("");
+  const [text, setText] = useState("");
+  const submit = () => {
+    const description = text.trim();
+    if (!description || busy) return;
+    onSubmit({ region, description });
+  };
+
+  return (
+    <section className="where-panel" aria-label="Where am I?">
+      <div className="where-head">
+        <strong>📍 Where am I?</strong>
+        <button type="button" className="where-close" onClick={onClose} aria-label="Close Where am I">×</button>
+      </div>
+      <p className="where-note">
+        Describe what you see in your own words: shape, colour, direction, what sits next to it.
+        Please do not upload or paste photos of donors. They are protected.
+      </p>
+      <div className="where-row">
+        <select value={region} onChange={(event) => setRegion(event.target.value)} aria-label="Region (optional)">
+          <option value="">Region (optional)</option>
+          {REGIONS.map((r) => <option key={r} value={r}>{r}</option>)}
+        </select>
+      </div>
+      <textarea value={text} rows={3} maxLength={900} aria-label="What you can see"
+        placeholder="e.g. A long strap-like muscle on the front of the upper arm, with a thick tendon near the elbow"
+        onChange={(event) => setText(event.target.value)} />
+      <div className="where-actions">
+        <button type="button" className="send-button" disabled={!text.trim() || busy} onClick={submit}>Find my place</button>
+      </div>
+    </section>
+  );
+}
+
+// ---------- Lab bench: a side panel that stays open next to the chat while the student is at the table ----------
+
+const BENCH_KEY = "askInglisBench";
+
+// "The Biceps Brachii?" and "biceps brachii" are the same topic, so they must give the same guide.
+const normalizeTopic = (t) => String(t || "").toLowerCase().replace(/\s+/g, " ").replace(/[?.!]+$/, "").replace(/^(the|a|an)\s+/, "").trim();
+const niceTopic = (t) => (t ? t.charAt(0).toUpperCase() + t.slice(1) : t);
+
+// ---------- Due for review: steps flagged Revisit and quiz topics missed come back after 1, 3 and 7 days ----------
+const DUE_KEY = "askInglisDue";
+const DUE_DAYS = [1, 3, 7];
+const DAY_MS = 86400000;
+
+function readDue() {
+  try {
+    const list = JSON.parse(localStorage.getItem(DUE_KEY) || "[]");
+    return Array.isArray(list)
+      ? list.filter((d) => d && d.topic && Number.isFinite(d.ts) && d.stage < DUE_DAYS.length && Date.now() - d.ts < RETENTION_MS)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeDue(list) {
+  try { localStorage.setItem(DUE_KEY, JSON.stringify(list)); } catch { /* storage full or blocked */ }
+}
+
+function planBenchReview(topic, count) {
+  const list = readDue().filter((d) => d.topic !== topic);
+  if (count > 0) list.push({ topic, count, stage: 0, ts: Date.now() });
+  writeDue(list);
+}
+
+function advanceBenchReview(topic) {
+  writeDue(readDue().map((d) => (d.topic === topic ? { ...d, stage: d.stage + 1, ts: Date.now() } : d)));
+}
+
+// What is due today: lab steps to revisit, and quiz topics missed at least a day ago.
+function dueNow(missed) {
+  const now = Date.now();
+  const days = (ts) => Math.max(1, Math.floor((now - ts) / DAY_MS));
+  const bench = readDue()
+    .filter((d) => now - d.ts >= DUE_DAYS[d.stage] * DAY_MS)
+    .map((d) => ({ kind: "bench", topic: d.topic, count: d.count, days: days(d.ts) }));
+  const byTopic = new Map();
+  for (const m of missed) {
+    const e = byTopic.get(m.topic) || { count: 0, ts: 0 };
+    byTopic.set(m.topic, { count: e.count + 1, ts: Math.max(e.ts, m.ts) });
+  }
+  const quiz = [...byTopic]
+    .filter(([, e]) => now - e.ts >= DAY_MS)
+    .map(([topic, e]) => ({ kind: "quiz", topic, count: e.count, days: days(e.ts) }));
+  return [...bench, ...quiz];
+}
+
+function loadBench() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(BENCH_KEY) || "null");
+    if (saved && saved.topic && saved.content && Date.now() - saved.ts < RETENTION_MS) return saved;
+  } catch {
+    /* no saved session */
+  }
+  return null;
+}
+
+const plainLine = (t, max) => {
+  const line = String(t || "").split("\n").map((l) => l.replace(/[*`#>_]/g, "").replace(/^\s*[-•\d.)]+\s*/, "").trim()).find(Boolean) || "";
+  return line.length > max ? `${line.slice(0, max - 1).replace(/\s+\S*$/, "")}…` : line;
+};
+
+// Built from the steps the student actually saw. No extra model call, so it always matches the guide.
+function benchSummary(topic, steps, marks, asked, found) {
+  const clear = steps.filter((_, i) => marks[i] === "ok" && !asked[i]).length;
+  const lines = [`**Lab session: ${topic}**`, "", `${clear} of ${steps.length} steps felt clear.`, "", "**What we covered**"];
+  steps.forEach((text, i) => {
+    const needs = marks[i] === "help" || asked[i];
+    const tag = needs ? "revisit" : marks[i] === "ok" ? "clear" : "skipped";
+    const said = found[i] ? ` Where am I? said: ${plainLine(found[i], 110)}` : "";
+    lines.push(`${i + 1}. ${plainLine(text, 110)} (${tag}).${said}`);
+  });
+  const revisit = steps.map((_, i) => i + 1).filter((n) => marks[n - 1] === "help" || asked[n - 1]);
+  if (revisit.length) lines.push("", `**Revisit:** step ${revisit.join(", ")}`);
+  return lines.join("\n");
+}
+
+function LabBench({ open, seed, onClose, onSave, onQuiz }) {
+  const [saved] = useState(loadBench);
+  const [topic, setTopic] = useState(saved?.topic || "");
+  const [draft, setDraft] = useState("");
+  const [content, setContent] = useState(saved?.content || "");
+  const [lectures, setLectures] = useState(saved?.lectures || []);
+  const [sources, setSources] = useState(saved?.sources || []);
+  const [status, setStatus] = useState("idle");
+  const [index, setIndex] = useState(saved?.index || 0);
+  const [marks, setMarks] = useState(saved?.marks || []);
+  const [asked, setAsked] = useState(saved?.asked || []);
+  const [found, setFound] = useState(saved?.found || []);
+  const [added, setAdded] = useState(false);
+  const [finished, setFinished] = useState(false);
+  const [whereOpen, setWhereOpen] = useState(false);
+  const [overview, setOverview] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [located, setLocated] = useState("");
+  const [speaking, setSpeaking] = useState(false);
+  const [problem, setProblem] = useState("");
+
+  const parts = useMemo(() => splitLayered(content) || splitSteps(content), [content]);
+  const steps = parts?.steps || [];
+  const extra = parts?.extras?.[index];
+
+  useEffect(() => {
+    try {
+      if (content) localStorage.setItem(BENCH_KEY, JSON.stringify({ topic, content, lectures, sources, index, marks, asked, found, ts: Date.now() }));
+    } catch {
+      /* storage full or blocked */
+    }
+  }, [topic, content, lectures, sources, index, marks, asked, found]);
+
+  useEffect(() => () => { if (CAN_SPEAK) window.speechSynthesis.cancel(); }, []);
+
+  const start = async (raw) => {
+    const wanted = normalizeTopic(raw);
+    if (!wanted) return;
+    setTopic(wanted); setStatus("loading"); setFinished(false); setLocated("");
+    setIndex(0); setMarks([]); setAsked([]); setFound([]); setAdded(false); setContent(""); setProblem("");
+    try {
+      const response = await fetch(`${API_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: buildPayload("dissect", wanted), history: [], mode: "dissect" }),
+      });
+      if (!response.ok) throw new Error(`Lab bench request failed (${response.status})`);
+      const data = await response.json();
+      setContent(data.reply || "");
+      setLectures(data.lectures || []);
+      setSources(data.sources || []);
+      setStatus("idle");
+    } catch (error) {
+      console.error(error);
+      setStatus("error");
+    }
+  };
+
+  useEffect(() => {
+    if (!seed) return undefined;
+    const id = window.setTimeout(() => start(seed.topic), 0);
+    return () => window.clearTimeout(id);
+  }, [seed]);
+
+  const stopSpeech = () => { if (CAN_SPEAK) window.speechSynthesis.cancel(); setSpeaking(false); };
+  const go = (next) => { stopSpeech(); setIndex(Math.max(0, Math.min(steps.length - 1, next))); };
+  const speak = () => {
+    if (speaking) { stopSpeech(); return; }
+    const text = `Step ${index + 1}. ${steps[index].replace(/[*`]/g, "")}${extra?.see ? ` You should see: ${extra.see.replace(/[*`]/g, "")}` : ""}`;
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.onend = () => setSpeaking(false);
+    utterance.onerror = () => setSpeaking(false);
+    window.speechSynthesis.cancel();
+    setSpeaking(true);
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const finish = () => {
+    stopSpeech();
+    setFinished(true);
+    planBenchReview(niceTopic(topic), steps.filter((_, i) => marks[i] === "help" || asked[i]).length);
+  };
+
+  const clear = () => {
+    stopSpeech();
+    setTopic(""); setContent(""); setLectures([]); setSources([]); setIndex(0); setMarks([]); setAsked([]); setFound([]); setAdded(false);
+    setFinished(false); setLocated(""); setWhereOpen(false); setStatus("idle");
+    try { localStorage.removeItem(BENCH_KEY); } catch { /* ignore */ }
+  };
+
+  const locate = async ({ region, description }) => {
+    if (locating) return;
+    setLocating(true); setProblem(""); setWhereOpen(false);
+    setAsked((old) => { const next = [...old]; next[index] = true; return next; });
+    const where = region ? `I am dissecting the ${region.toLowerCase()}. ` : `I am working on ${topic}. `;
+    try {
+      const response = await fetch(`${API_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: `${where}What I can see: ${description}. Where am I, and what should I do next?`, history: [], mode: "locate" }),
+      });
+      if (!response.ok) throw new Error(`Where am I request failed (${response.status})`);
+      const data = await response.json();
+      setLocated(data.reply || "");
+      setFound((old) => { const next = [...old]; next[index] = data.reply || ""; return next; });
+    } catch (error) {
+      console.error(error);
+      setProblem("Could not get an answer. Please check the connection and try again.");
+    } finally {
+      setLocating(false);
+    }
+  };
+
+  const printChecklist = () => {
+    const done = () => { document.body.classList.remove("printing-checklist"); window.removeEventListener("afterprint", done); };
+    document.body.classList.add("printing-checklist");
+    window.addEventListener("afterprint", done);
+    window.setTimeout(() => window.print(), 80);
+  };
+
+  const mark = (value) => setMarks((old) => { const next = [...old]; next[index] = value; return next; });
+  const gotIt = () => { mark("ok"); if (index < steps.length - 1) go(index + 1); else finish(); };
+  const clearCount = steps.filter((_, i) => marks[i] === "ok" && !asked[i]).length;
+
+  return (
+    <>
+    <aside className={`bench ${open ? "open" : ""}`} aria-label="Lab bench" aria-hidden={!open}>
+      <div className="bench-head">
+        <div>
+          <strong>🔬 Lab bench</strong>
+          <span>{niceTopic(topic) || "Your guide at the table"}</span>
+        </div>
+        <button type="button" className="bench-close" onClick={onClose} aria-label="Close lab bench">×</button>
+      </div>
+
+      <div className="bench-body">
+        {!topic && status !== "loading" && (
+          <div className="bench-start">
+            <p>Type a structure or region. The guide stays here while you keep asking questions in the chat.</p>
+            <input value={draft} maxLength={120} placeholder="e.g. the anterior triangle of the neck"
+              aria-label="Structure or region to dissect"
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") start(draft); }} />
+            <button type="button" className="send-button" disabled={!draft.trim()} onClick={() => start(draft)}>Start</button>
+          </div>
+        )}
+
+        {status === "loading" && <p className="bench-loading"><EcgLine /> Building your step-by-step guide…</p>}
+        {status === "error" && (
+          <div className="bench-error" role="alert">
+            Could not build the guide. Check the connection and try again.
+            <button type="button" onClick={() => start(topic)}>Try again</button>
+          </div>
+        )}
+
+        {topic && status === "idle" && !parts && content && (
+          <div className="bench-plain">
+            <FormattedAnswer content={content} />
+            <button type="button" className="step-link" onClick={clear}>Start a different structure</button>
+          </div>
+        )}
+
+        {parts && !finished && (
+          <>
+            {parts.head && <div className="bench-head-text"><FormattedAnswer content={parts.head} /></div>}
+            {overview ? (
+              <div className="bench-overview">
+                <div className="bench-overview-head">
+                  <strong>All {steps.length} steps</strong>
+                  <button type="button" onClick={() => setOverview(false)}>Back to step {index + 1}</button>
+                </div>
+                <ol>
+                  {steps.map((text, i) => {
+                    const needs = marks[i] === "help" || asked[i];
+                    return (
+                      <li key={i}>
+                        <button type="button" className={`ov-item ${i === index ? "current" : ""} ${needs ? "slow" : ""}`}
+                          onClick={() => { go(i); setOverview(false); }}>
+                          <span className="ov-num">{i + 1}</span>
+                          <span className="ov-text">{formatInline(text)}</span>
+                          <span className="ov-tag">{needs ? "Revisit" : marks[i] === "ok" ? "Clear" : i === index ? "Here" : ""}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              </div>
+            ) : (<>
+            <div className="bench-step">
+              <div className="step-count">Step {index + 1} of {steps.length}</div>
+              <div className="step-bar"><span style={{ width: `${((index + 1) / steps.length) * 100}%` }} /></div>
+              <p className="step-text">{formatInline(steps[index])}</p>
+              {extra && (extra.see || extra.careful || extra.stuck) && (
+                <div className="step-extras">
+                  {extra.see && <div className="step-extra see"><b>👁 You should see</b><span>{formatInline(extra.see)}</span></div>}
+                  {extra.careful && <div className="step-extra careful"><b>⛔ Do not cut</b><span>{formatInline(extra.careful)}</span></div>}
+                  {extra.stuck && <div className="step-extra stuck"><b>🔎 Can’t find it?</b><span>{formatInline(extra.stuck)}</span></div>}
+                </div>
+              )}
+            </div>
+
+            <div className="bench-marks" role="group" aria-label="How is this step going?">
+              <button type="button" className={`mark-help ${marks[index] === "help" ? "on" : ""}`}
+                aria-pressed={marks[index] === "help"} onClick={() => { mark("help"); setWhereOpen(true); }}>🆘 Need help</button>
+              <button type="button" className={`mark-ok ${marks[index] === "ok" ? "on" : ""}`}
+                aria-pressed={marks[index] === "ok"} onClick={gotIt}>
+                {index < steps.length - 1 ? "✅ Got it, next →" : "✅ Got it, finish"}
+              </button>
+            </div>
+
+            <div className="step-actions">
+              <button type="button" disabled={index === 0} onClick={() => go(index - 1)}>← Back</button>
+              {CAN_SPEAK && <button type="button" onClick={speak}>{speaking ? "■ Stop" : "🔊 Read"}</button>}
+              {index < steps.length - 1
+                ? <button type="button" onClick={() => go(index + 1)}>Skip →</button>
+                : <button type="button" onClick={finish}>Finish ✓</button>}
+            </div>
+            </>)}
+
+            <div className="bench-tools">
+              <button type="button" aria-pressed={overview} onClick={() => setOverview((o) => !o)}>☰ All steps</button>
+              <button type="button" onClick={printChecklist}>🖨 Print checklist</button>
+              <button type="button" onClick={finish}>Finish session</button>
+            </div>
+
+            {whereOpen && <WhereAmI busy={locating} onClose={() => setWhereOpen(false)} onSubmit={locate} />}
+            {locating && <p className="bench-loading"><EcgLine /> Matching what you see to the notes…</p>}
+            {problem && <p className="where-problem" role="alert">{problem}</p>}
+            {located && (
+              <div className="bench-located">
+                <div className="bench-located-head">
+                  <strong>📍 Where you are</strong>
+                  <button type="button" onClick={() => setLocated("")} aria-label="Dismiss">×</button>
+                </div>
+                <FormattedAnswer content={located} />
+              </div>
+            )}
+            {parts.tail && <div className="bench-tail"><FormattedAnswer content={parts.tail} /></div>}
+            {lectures.length > 0 && <p className="bench-source">From: {lectures.join(", ")}</p>}
+          </>
+        )}
+
+        {parts && finished && (
+          <div className="bench-done">
+            <h3>Session summary</h3>
+            <p className="bench-total">{clearCount} of {steps.length} steps felt clear</p>
+            <ol className="bench-pace">
+              {steps.map((text, i) => {
+                const needs = marks[i] === "help" || asked[i];
+                return (
+                  <li key={i} className={needs ? "slow" : ""}>
+                    <span className="pace-label">Step {i + 1}</span>
+                    <span className="pace-text">{formatInline(text)}</span>
+                    <span className="pace-tag">{needs ? "Revisit" : marks[i] === "ok" ? "Clear" : "Skipped"}</span>
+                  </li>
+                );
+              })}
+            </ol>
+            <div className="bench-done-actions">
+              <button type="button" className="primary" disabled={added}
+                onClick={() => { onSave(benchSummary(niceTopic(topic), steps, marks, asked, found), lectures, sources); setAdded(true); }}>
+                {added ? "Added to your chat ✓" : "Add summary to chat"}
+              </button>
+              <button type="button" onClick={() => onQuiz(niceTopic(topic))}>📝 Quiz me on this structure</button>
+              <button type="button" onClick={() => { setFinished(false); setIndex(0); }}>Back to steps</button>
+              <button type="button" onClick={clear}>New structure</button>
+            </div>
+          </div>
+        )}
+      </div>
+      {topic && !finished && parts && (
+        <button type="button" className="step-link bench-new" onClick={clear}>Start a different structure</button>
+      )}
+    </aside>
+    {parts && createPortal(
+      <div className="checklist-print" aria-hidden="true">
+        <h1>Dissection checklist</h1>
+        <h2>{niceTopic(topic)}</h2>
+        <p className="cl-meta">{new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })} · Ask Inglis</p>
+        {parts.head && <p className="cl-head">{plainLine(parts.head, 240)}</p>}
+        <ol>
+          {steps.map((text, i) => {
+            const ex = parts.extras?.[i];
+            return (
+              <li key={i}>
+                <span className="cl-box" />
+                <div>
+                  <p className="cl-step">{formatInline(text)}</p>
+                  {ex?.see && <p className="cl-note"><b>You should see:</b> {formatInline(ex.see)}</p>}
+                  {ex?.careful && <p className="cl-note"><b>Do not cut:</b> {formatInline(ex.careful)}</p>}
+                  {ex?.stuck && <p className="cl-note"><b>Can’t find it?</b> {formatInline(ex.stuck)}</p>}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+        {lectures.length > 0 && <p className="cl-foot">From: {lectures.join(", ")}. A study aid only. Follow your instructor and the lab rules.</p>}
+      </div>,
+      document.body
+    )}
+    </>
+  );
+}
+
 export default function App() {
   const [conversations, setConversations] = useState(() => {
     const existing = readConversations();
@@ -852,16 +1383,21 @@ export default function App() {
   const [mode, setMode] = useState("ask");
   const [loadingText, setLoadingText] = useState("Thinking…");
   const [copiedId, setCopiedId] = useState(null);
+  const [readingId, setReadingId] = useState(null);
+  useEffect(() => () => { if (CAN_SPEAK) window.speechSynthesis.cancel(); }, []);
   const [reviewed, setReviewed] = useState({});
   const [editingId, setEditingId] = useState(null);
   const [undo, setUndo] = useState(null);
   const [printIds, setPrintIds] = useState(null);
   const undoTimer = useRef(null);
-  const [listening, setListening] = useState(false);
-  const [speakingId, setSpeakingId] = useState(null);
-  const recRef = useRef(null);
   const inputRef = useRef(null);
+  const [benchOpen, setBenchOpen] = useState(false);
+  const [benchSeed, setBenchSeed] = useState(null);
   const [missed, setMissed] = useState(readMissed);
+  const [greeting] = useState(() => {
+    const hour = new Date().getHours();
+    return hour < 5 ? "Hello" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+  });
   const messagesEndRef = useRef(null);
 
   const current = conversations.find((item) => item.id === activeId)
@@ -881,11 +1417,6 @@ export default function App() {
     const clear = () => setPrintIds(null);
     window.addEventListener("afterprint", clear);
     return () => window.removeEventListener("afterprint", clear);
-  }, []);
-
-  useEffect(() => () => {
-    recRef.current?.abort?.();
-    if (CAN_SPEAK) window.speechSynthesis.cancel();
   }, []);
 
   useEffect(() => {
@@ -940,7 +1471,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    // The welcome screen starts at the top; a conversation follows the newest message.
+    if (messages.length === 0) messagesEndRef.current?.parentElement?.scrollTo({ top: 0 });
+    else messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length, loadingId, activeId]);
 
   const selectConversation = (id) => {
@@ -989,6 +1522,7 @@ export default function App() {
   const generateTitle = async (conversationId, firstQuestion, titleMode) => {
     const fallbackTitle = smartTitle(firstQuestion, titleMode === "ask" ? undefined : titleMode);
     const hint = titleMode === "dissect" ? "Dissection steps for: "
+      : titleMode === "locate" ? "Locating a structure in the dissection lab: "
       : titleMode === "images" ? "Diagram search: " : "";
     try {
       const response = await fetch(`${API_URL}/title`, {
@@ -1012,20 +1546,21 @@ export default function App() {
     }
   };
 
-  const ask = async (overrideText, overrideMode, skipTitle = false) => {
+  const ask = async (overrideText, overrideMode, skipTitle = false, apiMode = "", shownText = "", meta = null) => {
     const text = (typeof overrideText === "string" ? overrideText : question).trim();
     const picked = overrideMode || mode;
     const activeMode = picked === "guided" ? "ask" : picked;
     if (!text || !current || loadingId) return;
-    const payload = buildPayload(activeMode, text);
+    const payload = apiMode === "locate" ? text : buildPayload(activeMode, text);
+    const storeMode = apiMode === "locate" ? "locate" : activeMode === "ask" ? undefined : activeMode;
     setLoadingText(
-      /\bquiz questions\b|\banother set\b/i.test(payload) ? "Writing and checking questions. This takes about 20 to 40 seconds…"
+      apiMode === "locate" ? "Matching what you see to the notes…"
+        : /\bquiz questions\b|\banother set\b/i.test(payload) ? "Writing and checking questions. This takes about 20 to 40 seconds…"
         : PICKS_ONLY.test(payload) || /\banswers?\b/i.test(payload) ? "Checking your answers…"
         : activeMode === "dissect" ? "Finding the dissection steps…"
         : "Thinking…"
     );
     const conversationId = current.id;
-    recRef.current?.stop?.();
     const cut = editingId && typeof overrideText !== "string"
       ? current.messages.findIndex((m) => m.id === editingId) : -1;
     const previous = cut >= 0 ? current.messages.slice(0, cut) : [...current.messages];
@@ -1033,10 +1568,9 @@ export default function App() {
     const history = previous.slice(-CONTEXT_MESSAGES).map(({ role, content }) => ({ role, content }));
     updateMessages(conversationId, (old) => [
       ...(cut >= 0 ? old.slice(0, cut) : old),
-      { id: crypto.randomUUID(), role: "user", content: text,
-        mode: activeMode === "ask" ? undefined : activeMode },
+      { id: crypto.randomUUID(), role: "user", content: shownText || text, mode: storeMode, ...(meta || {}) },
     ]);
-    if (previous.length === 0 && !skipTitle) void generateTitle(conversationId, text, activeMode);
+    if (previous.length === 0 && !skipTitle) void generateTitle(conversationId, text, storeMode || activeMode);
     setQuestion("");
     setError("");
     setLoadingId(conversationId);
@@ -1045,7 +1579,7 @@ export default function App() {
       const response = await fetch(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: payload, history }),
+        body: JSON.stringify({ message: payload, history, mode: activeMode === "dissect" ? (apiMode || "dissect") : undefined }),
       });
       if (!response.ok) throw new Error(`Chat request failed (${response.status})`);
       const data = await response.json();
@@ -1063,10 +1597,10 @@ export default function App() {
         ...old,
         {
           id: crypto.randomUUID(), role: "assistant",
-          content: data.reply || "No answer returned.", question: text,
+          content: data.reply || "No answer returned.", question: shownText || text,
           lectures: data.lectures || [], images: data.images || [],
           sources: (data.sources || []).map((src) => String(src).slice(0, 700)),
-          mode: activeMode === "dissect" ? "dissect" : undefined,
+          mode: apiMode === "locate" ? "locate" : activeMode === "dissect" ? "dissect" : undefined,
           understoodAs: data.understood_as || undefined,
           degraded: Boolean(data.degraded), feedback: null,
         },
@@ -1081,7 +1615,7 @@ export default function App() {
 
   const startEdit = (message) => {
     setEditingId(message.id);
-    setMode(message.mode || "ask");
+    setMode(message.mode === "images" ? "images" : "ask");
     setQuestion(message.content);
     setError("");
     window.setTimeout(() => inputRef.current?.focus(), 0);
@@ -1116,54 +1650,23 @@ export default function App() {
     setQuestion("");
   };
 
-  // Voice typing: the words land in the box, so the student can fix them before sending
-  const toggleMic = () => {
-    if (!SpeechRec) return;
-    if (listening) { recRef.current?.stop(); return; }
-    const rec = new SpeechRec();
-    rec.lang = "en-US";
-    rec.interimResults = true;
-    rec.continuous = false;
-    const base = question.trim() ? `${question.trim()} ` : "";
-    rec.onresult = (event) => {
-      let heard = "";
-      for (let i = 0; i < event.results.length; i++) heard += event.results[i][0].transcript;
-      setQuestion(base + heard);
-    };
-    rec.onend = () => setListening(false);
-    rec.onerror = (event) => {
-      setListening(false);
-      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-        setError("Microphone access is blocked. Allow it in your browser's site settings to use voice typing.");
-      }
-    };
-    recRef.current = rec;
-    setError("");
-    setListening(true);
-    try { rec.start(); } catch { setListening(false); }
-  };
-
-  const speakAnswer = (message) => {
-    if (!CAN_SPEAK) return;
-    if (speakingId === message.id) {
-      window.speechSynthesis.cancel();
-      setSpeakingId(null);
-      return;
-    }
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(speakableText(message.content));
-    utterance.onend = () => setSpeakingId(null);
-    utterance.onerror = () => setSpeakingId(null);
-    setSpeakingId(message.id);
-    window.speechSynthesis.speak(utterance);
-  };
-
   // Study sheet: print (or "Save as PDF") one question and its answer, without the rest of the screen
   const printSheet = (index) => {
     const ids = [messages[index].id];
     if (messages[index - 1]?.role === "user") ids.unshift(messages[index - 1].id);
     setPrintIds(ids);
     window.setTimeout(() => window.print(), 120);
+  };
+
+  const stopReading = () => { if (CAN_SPEAK) window.speechSynthesis.cancel(); setReadingId(null); };
+  const readAloud = (message) => {
+    if (readingId === message.id) { stopReading(); return; }
+    const utterance = new SpeechSynthesisUtterance(speakableText(message.content));
+    utterance.onend = () => setReadingId(null);
+    utterance.onerror = () => setReadingId(null);
+    window.speechSynthesis.cancel();
+    setReadingId(message.id);
+    window.speechSynthesis.speak(utterance);
   };
 
   const copyAnswer = async (message) => {
@@ -1176,10 +1679,86 @@ export default function App() {
     }
   };
 
-  const pickStarter = (starter) => {
-    setMode(starter.mode);
-    setQuestion(starter.text);
+  const openBench = (topic) => {
+    setBenchOpen(true);
+    if (topic) setBenchSeed((old) => ({ topic, nonce: (old?.nonce || 0) + 1 }));
   };
+
+  const saveBenchSummary = (summary, lectures = [], sources = []) => {
+    if (!current) return;
+    updateMessages(current.id, (old) => [...old, {
+      id: crypto.randomUUID(), role: "assistant", content: summary, question: "",
+      lectures, images: [], sources, local: true, feedback: null,
+    }]);
+  };
+
+  const quizFromBench = (topic) => {
+    if (window.matchMedia("(max-width: 900px)").matches) setBenchOpen(false);  // the bench covers the chat on a phone
+    void ask(`Give me 5 quiz questions on ${topic}`, "ask");
+  };
+
+  const prefill = (text) => {
+    setMode("ask");
+    setQuestion(text);
+  };
+
+  // Welcome screen: where the student left off, and the stages of a lab day.
+  const resume = [];
+  if (messages.length === 0) {
+    const bench = loadBench();
+    const parts = bench ? (splitLayered(bench.content) || splitSteps(bench.content)) : null;
+    if (parts?.steps?.length) {
+      const total = parts.steps.length;
+      const revisit = parts.steps.filter((_, i) => bench.marks?.[i] === "help" || bench.asked?.[i]).length;
+      resume.push({
+        key: "bench", icon: "🔬", title: niceTopic(bench.topic),
+        detail: `Lab bench · step ${Math.min((bench.index || 0) + 1, total)} of ${total}${revisit ? ` · ${revisit} to revisit` : ""}`,
+        go: () => openBench(),
+      });
+    }
+    const due = dueNow(missed);
+    due.slice(0, 3).forEach((d) => {
+      const when = `${d.days} day${d.days > 1 ? "s" : ""} ago`;
+      resume.push(d.kind === "bench"
+        ? { key: `due-b-${d.topic}`, icon: "⏰", title: niceTopic(d.topic), tag: "Due for review",
+            detail: `Lab bench · ${d.count} step${d.count > 1 ? "s" : ""} to revisit · from ${when}`,
+            go: () => { advanceBenchReview(d.topic); openBench(d.topic); } }
+        : { key: `due-q-${d.topic}`, icon: "⏰", title: niceTopic(d.topic), tag: "Due for review",
+            detail: `Quiz · ${d.count} missed · ${when}`,
+            go: () => ask(`Give me 5 quiz questions on ${d.topic}`, "ask") });
+    });
+    if (missedTopics.length && !due.some((d) => d.kind === "quiz")) {
+      const top = missedTopics[0];
+      resume.push({
+        key: "missed", icon: "📝", title: `Review what I missed: ${top.topic}`,
+        detail: `${missedTopics.length} topic${missedTopics.length > 1 ? "s" : ""} from past quizzes`,
+        go: () => ask(`Give me 5 quiz questions on ${top.topic}`, "ask"),
+      });
+    }
+    const last = conversations.find((c) => c.id !== current?.id && c.messages.length > 0);
+    if (last) {
+      resume.push({ key: "chat", icon: "💬", title: nameOf(last), detail: "Your last conversation", go: () => selectConversation(last.id) });
+    }
+    resume.sort((x, y) => (y.tag ? 1 : 0) - (x.tag ? 1 : 0));  // due items first
+    resume.splice(4);
+  }
+  const labDay = [
+    { title: "In class", hint: "Understand it first", actions: [
+      { icon: "🫀", label: "Ask about a structure", go: () => prefill("What does the biceps brachii do?") },
+      { icon: "🖼️", label: "Find a diagram", go: () => setMode("images") },
+    ] },
+    { title: "Before lab", hint: "Plan your session", actions: [
+      { icon: "🧭", label: "Guided study", go: () => chooseMode("guided") },
+    ] },
+    { title: "At the table", hint: "Dissect with a guide", actions: [
+      { icon: "🔬", label: "Open the lab bench", go: () => openBench() },
+    ] },
+    { title: "After lab", hint: "Check what stuck", actions: [
+      { icon: "📝", label: "Quiz me", go: () => prefill("Quiz me on the brachium") },
+      { icon: "🔁", label: "Review what I missed", hide: missedTopics.length === 0,
+        go: () => ask(`Give me 5 quiz questions on ${missedTopics[0].topic}`, "ask") },
+    ] },
+  ];
 
   // Guided tab on a chat that already has messages starts a fresh conversation.
   const chooseMode = (id) => {
@@ -1193,7 +1772,7 @@ export default function App() {
     setConversations((old) => old.map((item) => (item.id === id
       ? { ...item, title: `${options.region}: ${options.topic}`, studyContext: options } : item)));
     setMode("ask");
-    void ask(buildStudyQuestion(options.region, options.topic, options.specimen), "ask", true);
+    void ask(buildStudyQuestion(options.region, options.topic, options.specimen), "ask", true, "", studyLine(options.region, options.topic, options.specimen));
   };
 
   const submitFeedback = async (message, rating, comment = "") => {
@@ -1281,7 +1860,8 @@ export default function App() {
               </button>
             ))}
           </div>
-          <span className="grounded">Grounded in course notes</span>
+          <button type="button" className="bench-toggle" aria-pressed={benchOpen}
+            onClick={() => (benchOpen ? setBenchOpen(false) : openBench())}>🔬 Lab bench</button>
         </header>
         {mode === "images" ? (
           <DiagramsTab onAsk={(caption) => { setMode("ask"); setQuestion(`Explain ${caption}`); }} />
@@ -1296,23 +1876,41 @@ export default function App() {
               disabled={Boolean(loadingId)} />
           )}
           {messages.length === 0 && mode !== "guided" && (
-            <div className="welcome">
-              <div className="welcome-emblem"><BrandMark size={44} /></div>
-              <div className="plate-label">Human anatomy study</div>
-              <h1>What would you like to learn?</h1>
-              <p>Ask a question, get quizzed, or get dissection steps. Every answer comes from Dr. Inglis's lecture notes.</p>
-              <div className="starters">
-                {STARTERS.map((s) => (
-                  <button type="button" className="starter" key={s.title} onClick={() => pickStarter(s)}>
-                    <span className="starter-icon" aria-hidden="true">{s.icon}</span>
-                    <strong>{s.title}</strong>
-                    <small>{s.text}</small>
-                  </button>
-                ))}
+            <div className="welcome lab-welcome">
+              <div className="welcome-top">
+                <div className="welcome-emblem"><BrandMark size={34} /></div>
+                <div className="plate-label">Human anatomy study</div>
               </div>
-              <button type="button" className="study-change-mode" onClick={() => chooseMode("guided")}>
-                🧭 Try guided study instead →
-              </button>
+              <h1>{greeting}. What would you like to do?</h1>
+              <p>Every answer comes from Dr. Inglis's lecture notes. Pick a stage of your lab day, or just type below.</p>
+
+              {resume.length > 0 && (
+                <div className="resume" aria-label="Continue where you left off">
+                  <div className="resume-label">Continue where you left off</div>
+                  {resume.map((r) => (
+                    <button type="button" className="resume-item" key={r.key} disabled={Boolean(loadingId)} onClick={r.go}>
+                      <span aria-hidden="true">{r.icon}</span>
+                      <span className="resume-text"><strong>{r.title}{r.tag && <em className="due-tag">{r.tag}</em>}</strong><small>{r.detail}</small></span>
+                      <span className="resume-go" aria-hidden="true">→</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <ol className="lab-day" aria-label="Your lab day">
+                {labDay.map((stage, n) => (
+                  <li className="lab-stage" key={stage.title}>
+                    <span className="stage-num" aria-hidden="true">{n + 1}</span>
+                    <strong>{stage.title}</strong>
+                    <small>{stage.hint}</small>
+                    <div className="stage-actions">
+                      {stage.actions.filter((a) => !a.hide).map((a) => (
+                        <button type="button" key={a.label} onClick={a.go}>{a.icon} {a.label}</button>
+                      ))}
+                    </div>
+                  </li>
+                ))}
+              </ol>
             </div>
           )}
           {current?.studyContext && messages.length > 0 && (
@@ -1343,7 +1941,7 @@ export default function App() {
                 {message.role === "assistant"
                   ? (quiz
                     ? <QuizCards items={quiz} locked={!isLatest}
-                        onSubmit={(picks) => ask(picks, "ask")}
+                        onSubmit={(picks, confidence) => ask(picks, "ask", false, "", "", { confidence })}
                         onShowAnswers={() => ask("show answers", "ask")} />
                     : <>
                         {message.understoodAs && (
@@ -1351,11 +1949,16 @@ export default function App() {
                         )}
                         {message.mode === "dissect"
                           ? <StepViewer content={message.content} messageId={message.id} />
-                          : <FormattedAnswer content={message.content} />}
+                          : isGraded
+                            ? <>
+                                <GradeBreakdown reply={message.content} confidence={messages[index - 1]?.confidence} />
+                                <FormattedAnswer content={highlightChoice(message.content)} />
+                              </>
+                            : <FormattedAnswer content={message.content} />}
                         {message.images?.[0]?.url && <Figure image={message.images[0]} />}
                       </>)
                   : <div className="user-text">
-                      {message.mode && <span className="mode-badge">{message.mode === "quiz" ? "Quiz" : "Dissection"}</span>}
+                      {message.mode && <span className="mode-badge">{message.mode === "quiz" ? "Quiz" : message.mode === "locate" ? "Where am I?" : "Dissection"}</span>}
                       {message.content}
                     </div>}
                 {message.role === "user" && !loadingId && (
@@ -1368,32 +1971,37 @@ export default function App() {
                 )}
                 {message.role === "assistant" && (
                   <>
-                    {message.degraded && (
+                    {!message.local && message.degraded && (
                       <p className="notice">The assistant is temporarily using retrieved note excerpts.</p>
                     )}
-                    <SourcePanel lectures={message.lectures} sources={message.sources} reviewed={reviewed} />
+                    {(!message.local || message.lectures?.length > 0) && <SourcePanel lectures={message.lectures} sources={message.sources} reviewed={reviewed} />}
                     <div className="feedback-actions">
-                      <button type="button" title="Helpful" aria-label="Helpful"
-                        disabled={Boolean(message.feedback) || Boolean(feedbackPendingId)}
-                        onClick={() => submitFeedback(message, "up")}>👍</button>
-                      <button type="button" title="Not helpful" aria-label="Not helpful"
-                        disabled={Boolean(message.feedback) || Boolean(feedbackPendingId)}
-                        onClick={() => { setFeedbackTarget(message); setFeedbackComment(""); }}>👎</button>
+                      {/* A lab summary is the student's own note, not an answer from the course notes, so no thumbs: they would reach the professor's review queue. */}
+                      {!message.local && (
+                        <>
+                          <button type="button" title="Helpful" aria-label="Helpful"
+                            disabled={Boolean(message.feedback) || Boolean(feedbackPendingId)}
+                            onClick={() => submitFeedback(message, "up")}>👍</button>
+                          <button type="button" title="Not helpful" aria-label="Not helpful"
+                            disabled={Boolean(message.feedback) || Boolean(feedbackPendingId)}
+                            onClick={() => { setFeedbackTarget(message); setFeedbackComment(""); }}>👎</button>
+                        </>
+                      )}
+                      {CAN_SPEAK && !message.local && !quiz && !isGraded && !message.mode && (
+                        <button type="button" title={readingId === message.id ? "Stop reading" : "Read answer aloud"}
+                          aria-label={readingId === message.id ? "Stop reading" : "Read answer aloud"}
+                          aria-pressed={readingId === message.id}
+                          onClick={() => readAloud(message)}>{readingId === message.id ? "■" : "🔊"}</button>
+                      )}
                       <button type="button" title="Copy answer" aria-label="Copy answer"
                         onClick={() => copyAnswer(message)}>
                         {copiedId === message.id ? "✓" : "⧉"}
                       </button>
                       <button type="button" title="Print or save as a study sheet" aria-label="Print or save as a study sheet"
                         onClick={() => printSheet(index)}>🖨</button>
-                      {CAN_SPEAK && (
-                        <button type="button" title="Read answer aloud" aria-label="Read answer aloud"
-                          onClick={() => speakAnswer(message)}>
-                          {speakingId === message.id ? "■" : "🔊"}
-                        </button>
-                      )}
                       {message.feedback && <span>Feedback submitted</span>}
                     </div>
-                    {isLatest && !message.degraded && !quiz && (
+                    {isLatest && !message.local && !message.degraded && !quiz && (
                       <div className="chips">
                         {isGraded ? (
                           <button type="button" onClick={() => ask("Give me another set of 5 quiz questions", "ask")}>
@@ -1404,9 +2012,8 @@ export default function App() {
                             <button type="button" onClick={() => ask(`Give me 5 quiz questions on ${topic}`, "ask")}>
                               📝 Quiz me on this
                             </button>
-                            <button type="button"
-                              onClick={() => ask(topic, "dissect")}>
-                              🧰 Dissection steps
+                            <button type="button" onClick={() => openBench(topic)}>
+                              🔬 Take this to the lab
                             </button>
                             <button type="button" onClick={() => ask(`Explain ${topic} in simpler terms`, "ask")}>
                               💡 Explain simpler
@@ -1474,7 +2081,7 @@ export default function App() {
           )}
           <div className="composer">
             <textarea ref={inputRef} spellCheck autoCorrect="on" autoCapitalize="sentences"
-              placeholder={listening ? "Listening… speak your question" : MODES.find((m) => m.id === mode).placeholder}
+              placeholder={MODES.find((m) => m.id === mode).placeholder}
               aria-label="Ask an anatomy question" value={question} maxLength={2000}
               onChange={(event) => setQuestion(event.target.value)}
               onKeyDown={(event) => {
@@ -1483,12 +2090,6 @@ export default function App() {
                 }
               }}
               disabled={Boolean(loadingId)} rows={2} />
-            {SpeechRec && (
-              <button type="button" className={`mic-button ${listening ? "on" : ""}`}
-                aria-label={listening ? "Stop voice typing" : "Voice typing"} aria-pressed={listening}
-                title="Voice typing (your browser's speech service turns your voice into text)"
-                disabled={Boolean(loadingId)} onClick={toggleMic}>🎤</button>
-            )}
             <button type="button" className="send-button"
               disabled={!question.trim() || Boolean(loadingId)} onClick={() => ask()}>Send</button>
           </div>
@@ -1497,6 +2098,7 @@ export default function App() {
         )}
         </>)}
       </main>
+      <LabBench open={benchOpen} seed={benchSeed} onClose={() => setBenchOpen(false)} onSave={saveBenchSummary} onQuiz={quizFromBench} />
 
       {feedbackTarget && (
         <div className="modal-overlay" role="presentation">

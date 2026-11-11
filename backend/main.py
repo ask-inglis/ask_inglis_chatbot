@@ -290,6 +290,7 @@ class Turn(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(max_length=2000)
     history: list[Turn] = Field(default_factory=list, max_length=12)
+    mode: str = Field(default="", max_length=16)  # "dissect" = layered guide, "locate" = Where am I?
 
 
 class TitleRequest(BaseModel):
@@ -485,7 +486,9 @@ def chat(request: ChatRequest, background: BackgroundTasks):
             if reply:
                 quiz_lectures = list(dict.fromkeys(i["lecture"] for i in items if i["lecture"]))
                 remember_answer(reply, quiz_lectures)
-                return ChatResponse(reply=reply, sources=[], lectures=quiz_lectures)
+                # Note passages are shown only now, after grading or "show answers": next to an unanswered question they could give it away.
+                passages = [i["evidence"][:700] for i in items if i.get("evidence")]
+                return ChatResponse(reply=reply, sources=passages, lectures=quiz_lectures)
         elif seen_quiz and (intent["kind"] == "answers" or parse_picks(request.message, 10)):
             return ChatResponse(
                 reply=(
@@ -508,9 +511,12 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         )
 
     # First questions (no history) can be answered from the cache
-    cacheable = not request.history
+    # Same topic, same lab guide: dissection guides are cached by topic so every student (and every retry) sees
+    # the same steps. "Where am I?" answers depend on the student's own words, so they are never cached.
+    cacheable = not request.history and request.mode != "locate"
+    cache_key = f"[{request.mode}] {request.message}" if request.mode else request.message
     if cacheable:
-        hit = cache_get(request.message)
+        hit = cache_get(cache_key)
         if hit:
             print(f"Cache hit after {time.time() - t0:.2f}s")
             record_answer(hit.get("lectures", []), "chat")
@@ -563,7 +569,34 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         'Use "General knowledge:" only for facts that are not in the notes.'
     )
 
-    if COMPARE_PATTERN.search(typed):
+    if request.mode == "locate":
+        # "Where am I?": the student describes what they see, in words. Never a photo.
+        format_rules = (
+            "- Start with one bold line: Most likely: <structure or region>, then (confident), (possible) or (not sure).\n"
+            "- **Confirm it:** 2 to 3 bullets, each a landmark or feature to check that tells it apart from look-alikes.\n"
+            "- **Look next:** 1 to 2 bullets on what lies next to it or deeper, and what to expose next.\n"
+            "- **Careful:** 1 bullet on what not to cut or damage here.\n"
+            "- **If it does not match:** 1 bullet naming what else it could be.\n"
+            "- If the description is too vague to place, do not guess. Say so and ask for 2 specific details "
+            "(for example direction of the fibres, nearby bone, or depth).\n"
+            "- A text description is never proof. End with exactly: Confirm with your instructor or atlas before cutting.\n"
+            "- Put structure names in **bold**. Start anything that is not in the notes with \"General knowledge:\". "
+            "Do not add a Body type note."
+        )
+    elif request.mode == "dissect":
+        # Layered dissection guide: every step says what to expect, what to protect, and what to do if lost
+        format_rules = (
+            "- Start with one bold line naming the region and what the student will expose.\n"
+            "- Then 4 to 7 numbered steps (1. 2. 3.). Each step is one action at the table, under 25 words.\n"
+            "- Under EVERY step add exactly three indented lines, each starting with a dash and one of these labels:\n"
+            "   - You should see: what is visible once the step is done, under 20 words.\n"
+            "   - Do not cut: the structure to protect at this step, or write: Nothing critical at this step.\n"
+            "   - Can't find it? one practical tip, under 20 words.\n"
+            "- Put structure names in **bold**. Use the dissection guides and lecture notes. Start anything that is "
+            "not in them with \"General knowledge:\".\n"
+            f"- After the steps: {body_rule}"
+        )
+    elif COMPARE_PATTERN.search(typed):
         # A side-by-side table: students compare structures all the time (origin, nerve, action...)
         format_rules = (
             "- Start with one bold line that states the main difference.\n"
@@ -644,7 +677,7 @@ Answer:"""
         "understood_as": typed if fixes else None,
     }
     if cacheable and answered:
-        cache_put(request.message, data)
+        cache_put(cache_key, data)
     return ChatResponse(**data)
 
 

@@ -326,3 +326,266 @@ body { background: var(--parch); color: var(--text); }
   .source-chip::before { display: none; }
   .source-chip { padding-left: 11px; }
 }
+
+
+/* ---------- Layered dissection guide and Where am I? ---------- */
+
+.step-extras { display: grid; gap: 8px; margin-top: 14px; }
+
+.step-extra {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.step-extra b { font-size: 14px; color: var(--ink-2); }
+.step-extra.see { background: #eef4f9; border-color: #d3e0ec; }
+.step-extra.careful { background: var(--artery-soft); border-color: #ecc9cb; }
+.step-extra.careful b { color: var(--artery-dark); }
+.step-extra.stuck { background: var(--nerve-soft); }
+
+.where-panel {
+  max-width: 815px;
+  margin: 0 auto 10px;
+  padding: 16px 18px;
+  background: var(--card);
+  border: 1px solid var(--line-2);
+  border-left: 4px solid var(--artery);
+  border-radius: 14px;
+  box-shadow: 0 6px 18px rgba(30, 50, 70, .08);
+}
+
+.where-head { display: flex; justify-content: space-between; align-items: center; color: var(--ink); }
+.where-close { border: 0; background: none; font-size: 22px; line-height: 1; color: var(--muted); cursor: pointer; }
+.where-note { margin: 6px 0 10px; font-size: 14px; line-height: 1.45; color: var(--muted); }
+.where-row { display: flex; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+
+.where-row select,
+.where-panel textarea {
+  font: inherit;
+  font-size: 15px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.where-panel textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+.where-panel textarea:focus-visible,
+.where-row select:focus-visible { outline: 2px solid var(--artery); outline-offset: 1px; }
+
+
+.where-problem { margin: 6px 0 0; font-size: 14px; color: var(--artery-dark); }
+.where-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+
+@media (max-width: 720px) {
+  .step-extra { grid-template-columns: 1fr; gap: 4px; }
+}
+
+
+/* ---------- Lab bench (side panel) ---------- */
+
+.bench-toggle {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+
+.bench-toggle[aria-pressed="true"] { background: var(--artery); border-color: var(--artery); color: #fff; }
+.bench-toggle:focus-visible { outline: 2px solid var(--artery); outline-offset: 2px; }
+
+.bench {
+  display: none;
+  flex-direction: column;
+  width: 390px;
+  flex-shrink: 0;
+  background: var(--card);
+  border-left: 1px solid var(--line-2);
+  box-shadow: -8px 0 24px rgba(30, 50, 70, .06);
+  min-height: 0;
+}
+
+.bench.open { display: flex; }
+
+.bench-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--line);
+  border-top: 4px solid var(--artery);
+}
+
+.bench-head div { display: grid; gap: 2px; min-width: 0; }
+.bench-head strong { font-family: var(--serif); font-size: 18px; color: var(--ink); }
+.bench-head span { font-size: 14px; color: var(--muted); overflow-wrap: anywhere; }
+.bench-close { border: 0; background: none; font-size: 26px; line-height: 1; color: var(--muted); cursor: pointer; }
+
+.bench-body { flex: 1; overflow-y: auto; padding: 14px 18px 18px; display: grid; gap: 12px; align-content: start; }
+
+.bench-start { display: grid; gap: 10px; font-size: 15px; line-height: 1.5; color: var(--text); }
+.bench-start p { margin: 0; }
+.bench-start input {
+  font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 10px; color: var(--text);
+}
+.bench-start input:focus-visible { outline: 2px solid var(--artery); outline-offset: 1px; }
+.bench-start .send-button { justify-self: end; }
+
+.bench-loading { margin: 0; display: flex; align-items: center; gap: 8px; font-size: 14.5px; color: var(--muted); }
+.bench-error { padding: 12px; border-radius: 10px; background: var(--artery-soft); color: var(--artery-dark); font-size: 14.5px; display: grid; gap: 8px; }
+.bench-error button { justify-self: start; font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--artery); background: #fff; color: var(--artery-dark); cursor: pointer; }
+
+.bench-head-text { font-size: 15px; }
+.bench-step { padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--parch); }
+.bench-step .step-text { font-size: 18px; margin: 10px 0 0; }
+.bench .step-extra { grid-template-columns: 1fr; gap: 2px; font-size: 14.5px; }
+
+.bench-marks { display: grid; grid-template-columns: 1fr 1.3fr; gap: 8px; }
+.bench-marks button {
+  font: inherit; font-size: 15px; font-weight: 600; padding: 11px 12px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--card); color: var(--ink-2);
+}
+.bench-marks .mark-help.on { background: var(--artery-soft); border-color: var(--artery); color: var(--artery-dark); }
+.bench-marks .mark-ok { background: var(--artery); border-color: var(--artery); color: #fff; }
+.bench-marks button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.bench-tools button, .bench-done-actions button {
+  font: inherit; font-size: 14.5px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line-2);
+  background: var(--card); color: var(--ink-2); cursor: pointer;
+}
+.bench-done-actions button.primary { background: var(--artery); border-color: var(--artery); color: #fff; }
+.bench-done-actions button:disabled { opacity: .6; cursor: default; }
+
+.bench .step-actions { display: flex; gap: 8px; }
+.bench .step-actions button { flex: 1; }
+
+.bench-tools { display: flex; gap: 8px; flex-wrap: wrap; }
+.bench .where-panel { max-width: none; margin: 0; box-shadow: none; }
+.bench-located { padding: 12px 14px; border: 1px solid var(--line-2); border-left: 4px solid var(--vein); border-radius: 12px; background: #fff; font-size: 15px; }
+.bench-located-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; color: var(--ink); }
+.bench-located-head button { border: 0; background: none; font-size: 20px; color: var(--muted); cursor: pointer; }
+.bench-tail { font-size: 14.5px; }
+.bench-source { margin: 0; font-size: 13px; color: var(--muted); }
+.bench-new { margin: 0 18px 14px; align-self: flex-start; }
+
+.bench-done h3 { margin: 0 0 4px; font-family: var(--serif); font-size: 20px; color: var(--ink); }
+.bench-total { margin: 0 0 10px; font-size: 22px; font-weight: 700; color: var(--artery-dark); }
+.bench-pace { list-style: none; margin: 0 0 14px; padding: 0; display: grid; gap: 8px; }
+.bench-pace li {
+  display: grid; grid-template-columns: 52px 1fr auto; gap: 10px; align-items: start;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; font-size: 14px; line-height: 1.4; color: var(--text);
+}
+.pace-label { font-weight: 700; color: var(--ink-2); }
+.pace-tag { font-size: 12.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--nerve-soft); color: var(--ink-2); }
+.bench-pace li.slow { background: var(--artery-soft); border-color: #ecc9cb; }
+.bench-pace li.slow .pace-tag { background: var(--artery); color: #fff; }
+.bench-done-actions { display: grid; gap: 8px; }
+
+@media (max-width: 900px) {
+  .bench.open { position: fixed; inset: 0; width: auto; z-index: 40; }
+}
+
+@media print {
+  .bench, .bench-toggle { display: none !important; }
+}
+
+/* ---- Quiz: how sure were you, and where to focus ---- */
+.quiz-sure { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; font-size: .82rem; color: var(--vein); }
+.quiz-sure > span { margin-right: 4px; }
+.sure-chip { border: 1px solid #cfd8e3; background: #fff; color: var(--ink); border-radius: 999px; padding: 4px 12px; font-size: .8rem; cursor: pointer; }
+.sure-chip:hover { border-color: var(--vein); }
+.sure-chip.on { background: var(--vein); border-color: var(--vein); color: #fff; }
+
+.grade-breakdown { border: 1px solid #dbe3ec; border-radius: 12px; background: #f8fafc; padding: 12px 14px; margin: 4px 0 14px; display: grid; gap: 8px; }
+.grade-breakdown > strong { font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; color: var(--vein); }
+.grade-row { display: grid; grid-template-columns: minmax(150px, 220px) auto 1fr; gap: 4px 12px; align-items: baseline; padding-left: 10px; border-left: 4px solid #cfd8e3; font-size: .9rem; }
+.grade-row.bad { border-left-color: var(--artery); }
+.grade-row.warn { border-left-color: #d49a3a; }
+.grade-row.info { border-left-color: var(--vein); }
+.grade-row.good { border-left-color: #5a9a6b; }
+.grade-title { font-weight: 700; color: var(--ink); }
+.grade-qs { font-weight: 600; color: var(--ink); }
+.grade-hint { color: #5b6b7b; }
+@media (max-width: 640px) { .grade-row { grid-template-columns: 1fr; } }
+
+/* ---------- Welcome: resume + the stages of a lab day ---------- */
+.welcome.lab-welcome { max-width: 920px; text-align: left; margin-top: clamp(0px, 1vh, 12px); }
+.lab-welcome .welcome-top { display: flex; align-items: center; gap: 16px; margin-bottom: 14px; }
+.lab-welcome .welcome-emblem { width: 52px; height: 52px; border-radius: 16px; flex: none; }
+.lab-welcome .plate-label { margin: 0; justify-content: flex-start; }
+.lab-welcome .plate-label::before { display: none; }
+.lab-welcome h1 { font-size: clamp(28px, 4vw, 40px); margin: 0 0 8px; }
+.lab-welcome > p { margin: 0 0 22px; max-width: 560px; }
+
+.resume { display: grid; gap: 8px; margin-bottom: 26px; }
+.resume-label, .lab-day-label { font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--vein); }
+.resume-item { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; background: #fff; border: 1px solid #d9e1ea; border-left: 4px solid var(--artery); border-radius: 12px; padding: 11px 14px; cursor: pointer; font: inherit; color: var(--ink); }
+.resume-item:hover { border-color: var(--vein); border-left-color: var(--artery); box-shadow: 0 4px 14px rgba(31, 41, 51, .08); }
+.resume-item:disabled { opacity: .6; cursor: default; }
+.resume-text { display: grid; gap: 1px; flex: 1; min-width: 0; }
+.resume-text strong { font-size: .98rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.resume-text small { color: var(--muted); font-size: .8rem; }
+.resume-go { color: var(--artery); font-weight: 700; }
+
+.lab-day { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; position: relative; }
+.lab-day::before { content: ""; position: absolute; left: 16px; right: 16px; top: 15px; height: 2px; background: #d3dce6; }
+.lab-stage { position: relative; display: flex; flex-direction: column; gap: 3px; padding: 0 14px 0 0; }
+.stage-num { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: var(--artery); color: #fff; font-weight: 700; font-size: .9rem; box-shadow: 0 0 0 5px var(--parch); position: relative; z-index: 1; margin-bottom: 8px; }
+.lab-stage strong { font-family: var(--serif); font-size: 1.1rem; color: var(--ink); }
+.lab-stage small { color: var(--muted); font-size: .82rem; margin-bottom: 8px; }
+.stage-actions { display: grid; gap: 6px; justify-items: start; }
+.stage-actions button { background: #fff; border: 1px solid #d3dce6; border-radius: 999px; padding: 6px 12px; font-size: .84rem; color: var(--ink); cursor: pointer; text-align: left; }
+.stage-actions button:hover { border-color: var(--artery); color: var(--artery-dark); background: var(--artery-soft); }
+@media (max-width: 900px) {
+  .lab-day { grid-template-columns: 1fr 1fr; row-gap: 22px; }
+  .lab-day::before { display: none; }
+}
+@media (max-width: 520px) { .lab-day { grid-template-columns: 1fr; } }
+
+/* ---------- Due for review tag ---------- */
+.due-tag { font-style: normal; font-size: .68rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; background: var(--artery-soft); color: var(--artery-dark); border: 1px solid #efc9cb; border-radius: 999px; padding: 2px 8px; margin-left: 8px; vertical-align: middle; }
+
+/* ---------- Lab bench: all steps ---------- */
+.bench-overview { display: grid; gap: 8px; margin-bottom: 8px; }
+.bench-overview-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.bench-overview-head button { background: none; border: 0; color: var(--artery-dark); cursor: pointer; font-size: .85rem; text-decoration: underline; }
+.bench-overview ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.ov-item { width: 100%; display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; align-items: start; text-align: left; background: #fff; border: 1px solid #d9e1ea; border-radius: 10px; padding: 9px 10px; cursor: pointer; font: inherit; color: var(--ink); }
+.ov-item:hover { border-color: var(--vein); }
+.ov-item.current { border-color: var(--artery); box-shadow: inset 3px 0 0 var(--artery); }
+.ov-item.slow { background: var(--artery-soft); }
+.ov-num { width: 24px; height: 24px; border-radius: 50%; background: #e8eef4; display: grid; place-items: center; font-size: .78rem; font-weight: 700; }
+.ov-text { font-size: .88rem; line-height: 1.4; }
+.ov-tag { font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--vein); white-space: nowrap; }
+.ov-item.slow .ov-tag { color: var(--artery-dark); }
+
+/* ---------- Printable checklist (only visible when printing from the lab bench) ---------- */
+.checklist-print { display: none; }
+@media print {
+  body.printing-checklist #root { display: none !important; }
+  body.printing-checklist .checklist-print { display: block; padding: 0; color: #000; font-family: Georgia, serif; }
+  .checklist-print h1 { font-size: 22pt; margin: 0 0 2pt; }
+  .checklist-print h2 { font-size: 15pt; margin: 0 0 4pt; font-weight: 600; }
+  .checklist-print .cl-meta, .checklist-print .cl-foot { font-size: 9.5pt; color: #444; margin: 0 0 10pt; }
+  .checklist-print .cl-head { font-size: 11pt; margin: 0 0 10pt; }
+  .checklist-print ol { list-style: none; margin: 0; padding: 0; }
+  .checklist-print li { display: flex; gap: 10pt; padding: 8pt 0; border-top: 1px solid #bbb; break-inside: avoid; }
+  .checklist-print .cl-box { flex: none; width: 13pt; height: 13pt; border: 1.5pt solid #000; margin-top: 2pt; }
+  .checklist-print .cl-step { margin: 0 0 3pt; font-size: 12pt; font-weight: 600; }
+  .checklist-print .cl-note { margin: 0 0 2pt; font-size: 10.5pt; }
+  .checklist-print .cl-foot { margin-top: 12pt; }
+}
