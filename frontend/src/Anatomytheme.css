@@ -589,3 +589,22 @@ body { background: var(--parch); color: var(--text); }
   .checklist-print .cl-note { margin: 0 0 2pt; font-size: 10.5pt; }
   .checklist-print .cl-foot { margin-top: 12pt; }
 }
+
+
+/* ---- Glossary: tap a bold term for a quick translation (text stays English) ---- */
+.term { cursor: help; border-bottom: 1.5px dotted var(--vein, #3f6f9f); }
+.term:hover, .term:focus-visible { background: rgba(63, 111, 159, .12); outline: none; border-radius: 3px; }
+.term-backdrop { position: fixed; inset: 0; z-index: 1190; background: transparent; }
+.term-popup { position: fixed; z-index: 1200; background: #fff; color: var(--ink, #1f2a37); border: 1px solid #cfd9e6;
+  border-radius: 12px; box-shadow: 0 12px 32px rgba(20, 40, 70, .22); padding: 12px 14px; font-size: 14px; }
+.term-head { display: flex; align-items: center; gap: 6px; }
+.term-head strong { flex: 1; font-size: 15px; }
+.term-say, .term-x { border: 0; background: #eef3f9; border-radius: 8px; width: 30px; height: 30px; cursor: pointer; font-size: 15px; }
+.term-x { font-size: 20px; line-height: 1; }
+.term-translation { margin: 8px 0 2px; font-size: 17px; font-weight: 600; color: var(--vein, #3f6f9f); }
+.term-meaning { margin: 2px 0 0; line-height: 1.4; }
+.term-muted { margin: 8px 0 0; color: #6b7a8c; }
+.term-foot { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.term-foot select { font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid #cfd9e6; border-radius: 8px; background: #fff; }
+.term-foot small { color: #6b7a8c; font-size: 11.5px; line-height: 1.35; }
+@media print { .term { border-bottom: 0; } .term-popup, .term-backdrop { display: none; } }

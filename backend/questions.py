@@ -1,3 +1,4 @@
+import difflib
 import json
 import os
 import random
@@ -14,7 +15,9 @@ from guides import rule_excerpts
 
 MAX_PER_REQUEST = 10
 PARALLEL_CALLS = max(1, int(os.environ.get("QUIZ_PARALLEL_CALLS", "3")))  # model calls run at the same time
-MAX_ROUNDS = 3  # rounds of writing + checking before giving up
+SPARES = max(0, int(os.environ.get("QUIZ_SPARES", "2")))  # extra questions written per round, since some fail the checks
+SHORT_OK = max(0, int(os.environ.get("QUIZ_SHORT_OK", "0")))  # deliver a quiz this many questions short instead of another round
+MAX_ROUNDS = max(1, int(os.environ.get("QUIZ_MAX_ROUNDS", "3")))  # rounds of writing + checking before giving up
 ANGLES = [
     "where structures attach, start, end or are located",
     "nerve supply, blood supply and what the structure does",
@@ -401,6 +404,30 @@ def _write_batch(prompt: str, generate) -> list[dict]:
     return parsed
 
 
+_STOP = set("a an the of in on at to for and or is are was were be by with from that this which what who whom following most likely "
+            "patient student medical dissecting dissection identifies identified structure muscle nerve artery presents".split())
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z]+", text.lower()) if len(w) > 2 and w not in _STOP}
+
+
+def too_similar(stem: str, known: list[str]) -> bool:
+    """True if `stem` is the same question as one in `known`, even when it is worded a little differently."""
+    norm = " ".join(re.findall(r"[a-z0-9]+", stem.lower()))
+    mine = _words(stem)
+    for other in known:
+        o_norm = " ".join(re.findall(r"[a-z0-9]+", other.lower()))
+        if not o_norm:
+            continue
+        if difflib.SequenceMatcher(None, norm, o_norm).ratio() >= 0.85:
+            return True
+        theirs = _words(other)
+        if len(mine) >= 4 and len(theirs) >= 4 and len(mine & theirs) / len(mine | theirs) >= 0.7:
+            return True
+    return False
+
+
 def generate_questions(topic: str, count: int, generate, avoid: list[str] | None = None) -> dict:
     """Write, check and shuffle questions. `generate` is the app's LLM function.
     A question is only returned if it passes the NBME-style checks, is grounded in the notes and
@@ -432,13 +459,13 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
     # have enough, or two rounds in a row add nothing (the notes probably can't support more).
     for round_no in range(MAX_ROUNDS):
         need = count - len(accepted)
-        if need <= 0 or empty_rounds >= 2:
+        if need <= max(0, min(SHORT_OK, count - 1)) or empty_rounds >= 2:
             break
         before = len(accepted)
-        total = need + 2  # two spares, since some will fail the checks
+        total = need + SPARES  # spares, since some will fail the checks
         workers = max(1, min(PARALLEL_CALLS, total))
         sizes = [total // workers + (1 if i < total % workers else 0) for i in range(workers)]
-        known = avoid + [q["stem"] for q in accepted]
+        known = avoid[-25:] + [q["stem"] for q in accepted]  # the prompt only carries the 25 most recent; the check below uses all
         prompts = []
         for i, size in enumerate(sizes):
             angle = ANGLES[(round_no * workers + i) % len(ANGLES)] if workers > 1 else ""
@@ -473,7 +500,7 @@ def generate_questions(topic: str, count: int, generate, avoid: list[str] | None
             problems = validate_item(item)
             if not problems and not is_grounded(item, notes):
                 problems.append("the correct answer is not supported by the notes")
-            if item["stem"].lower() in seen:
+            if item["stem"].lower() in seen or too_similar(item["stem"], avoid):
                 problems.append("duplicate question")
             if not problems and any(_same_answer(c["options"][c["answer"]], item["options"][item["answer"]])
                                     for c in candidates + accepted):

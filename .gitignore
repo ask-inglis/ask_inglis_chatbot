@@ -3,3 +3,5 @@ __pycache__/
 .env
 chroma_store/
 .DS_Store
+chatlog/
+loadtest_log/

@@ -1,14 +1,16 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import "./App.css";
 import "./GuidedStudy.css";
 import "./AnatomyTheme.css";
+import "./Translation.css";
 
 const API_URL = (
   import.meta.env.VITE_BACKEND_URL || "http://localhost:8000"
 ).replace(/\/$/, "");
 
 const STORAGE_KEY = "askInglisConversations";
+const LANGUAGE_KEY = "askInglisPreferredLanguage";
 const RETENTION_DAYS = 30;
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60 * 1000;
@@ -127,12 +129,33 @@ function readConversations() {
   }
 }
 
+// Glossary: short bold terms become tappable so a learner can see them in their own language.
+// The text itself stays English. Quizzes switch it off by providing null.
+const GlossaryContext = createContext(null);
+const NOT_TERMS = /^(general knowledge|body type note|you should see|do not cut|origin|insertion|action|actions|innervation|nerve supply|blood supply)\b/i;
+function isGlossTerm(text) {
+  const t = text.trim();
+  return t.length >= 3 && t.length <= 40 && t.split(/\s+/).length <= 5
+    && /[a-z]/i.test(t) && !/[:.?!]$/.test(t) && !NOT_TERMS.test(t) && !/^lecture\b/i.test(t);
+}
+function Term({ text }) {
+  const openTerm = useContext(GlossaryContext);
+  if (!openTerm || !isGlossTerm(text)) return <strong>{text}</strong>;
+  return (
+    <strong className="term" role="button" tabIndex={0} title="Tap for a quick translation"
+      onClick={(event) => openTerm(text.trim(), event.currentTarget)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openTerm(text.trim(), event.currentTarget); }
+      }}>{text}</strong>
+  );
+}
+
 function formatInline(text) {
   return String(text)
     .split(/(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\n]+\*)/g)
     .map((part, i) => {
       if (part.startsWith("**") && part.endsWith("**")) {
-        return <strong key={i}>{part.slice(2, -2)}</strong>;
+        return <Term key={i} text={part.slice(2, -2)} />;
       }
       if (part.startsWith("`") && part.endsWith("`")) {
         return <code key={i}>{part.slice(1, -1)}</code>;
@@ -550,7 +573,11 @@ const CONFIDENCE = [
   { id: "guess", label: "Guessing" },
 ];
 
-function QuizCards({ items, locked, onSubmit, onShowAnswers }) {
+function QuizCards(props) {
+  return <GlossaryContext.Provider value={null}><QuizCardsInner {...props} /></GlossaryContext.Provider>;
+}
+
+function QuizCardsInner({ items, locked, onSubmit, onShowAnswers }) {
   const [picks, setPicks] = useState({});
   const [sureness, setSureness] = useState({});
   const answered = Object.keys(picks).length;
@@ -771,6 +798,103 @@ function FormattedAnswer({ content }) {
 
 // ---------- Guided Study (region + topic + specimen -> one focused question) ----------
 
+// Translation is display-only: the English answer stays in the conversation, translations are cached per message.
+const LANGUAGES = [
+  { code: "ko", name: "Korean", label: "한국어 (Korean)", voice: "ko-KR" },
+  { code: "es", name: "Spanish", label: "Español (Spanish)", voice: "es-ES" },
+  { code: "zh", name: "Simplified Chinese", label: "简体中文 (Chinese)", voice: "zh-CN" },
+  { code: "ja", name: "Japanese", label: "日本語 (Japanese)", voice: "ja-JP" },
+  { code: "fr", name: "French", label: "Français (French)", voice: "fr-FR" },
+  { code: "de", name: "German", label: "Deutsch (German)", voice: "de-DE" },
+  { code: "hi", name: "Hindi", label: "हिन्दी (Hindi)", voice: "hi-IN" },
+  { code: "ar", name: "Arabic", label: "العربية (Arabic)", voice: "ar-SA" },
+  { code: "pt", name: "Portuguese", label: "Português (Portuguese)", voice: "pt-BR" },
+  { code: "vi", name: "Vietnamese", label: "Tiếng Việt (Vietnamese)", voice: "vi-VN" },
+];
+
+function TermPopup({ gloss, language, onLanguage, onClose, apiUrl }) {
+  const [state, setState] = useState({ loading: true });
+  const cache = useRef(new Map());
+  const lang = LANGUAGES.find((l) => l.code === language) || LANGUAGES[0];
+  const term = gloss.term;
+  useEffect(() => {
+    const key = `${lang.code}|${term.toLowerCase()}`;
+    const hit = cache.current.get(key);
+    if (hit) { setState(hit); return undefined; }
+    const controller = new AbortController();
+    setState({ loading: true });
+    (async () => {
+      try {
+        const response = await fetch(`${apiUrl}/gloss`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+          body: JSON.stringify({ term, target_language: lang.name }),
+        });
+        if (response.status === 404 && (await response.clone().text()).includes("No glossary")) throw new Error("This one is not in the glossary.");
+        if (response.status === 404 || response.status === 405) throw new Error("The glossary is not available on this server yet.");
+        if (!response.ok) throw new Error("The glossary is unavailable right now.");
+        const data = await response.json();
+        const done = { translation: data.translation, meaning: data.meaning };
+        cache.current.set(key, done);
+        setState(done);
+      } catch (err) {
+        if (!controller.signal.aborted) setState({ error: err.message || "The glossary is unavailable right now." });
+      }
+    })();
+    return () => controller.abort();
+  }, [term, lang.code, lang.name, apiUrl]);
+  useEffect(() => {
+    const onKey = (event) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const say = () => {
+    if (!CAN_SPEAK) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(term);
+    utterance.lang = "en-US";
+    window.speechSynthesis.speak(utterance);
+  };
+  const width = 300;
+  const left = Math.max(12, Math.min(gloss.x, window.innerWidth - width - 12));
+  const below = gloss.y + 190 < window.innerHeight;
+  const style = { left, width, ...(below ? { top: gloss.y + 8 } : { bottom: window.innerHeight - gloss.top + 8 }) };
+  return createPortal(
+    <>
+      <div className="term-backdrop" onClick={onClose} />
+      <div className="term-popup" style={style} role="dialog" aria-label={`Glossary: ${term}`}>
+        <div className="term-head">
+          <strong>{term}</strong>
+          {CAN_SPEAK && <button type="button" className="term-say" onClick={say} aria-label="Hear the English term">🔊</button>}
+          <button type="button" className="term-x" onClick={onClose} aria-label="Close glossary">×</button>
+        </div>
+        {state.loading && <p className="term-muted">Looking it up…</p>}
+        {state.error && <p className="term-muted">{state.error}</p>}
+        {state.translation && (
+          <>
+            <p className="term-translation" lang={lang.voice}>{state.translation}</p>
+            {state.meaning && <p className="term-meaning">{state.meaning}</p>}
+          </>
+        )}
+        <div className="term-foot">
+          <select value={lang.code} onChange={(event) => onLanguage(event.target.value)} aria-label="Glossary language">
+            {LANGUAGES.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+          </select>
+          <small>AI translation. Learn the English term; your exam is in English.</small>
+        </div>
+      </div>
+    </>,
+    document.body,
+  );
+}
+
+function readPreferredLanguage() {
+  try {
+    const saved = localStorage.getItem(LANGUAGE_KEY);
+    if (LANGUAGES.some((lang) => lang.code === saved)) return saved;
+  } catch { /* storage blocked */ }
+  return "ko";
+}
+
 const REGIONS = ["Head & Neck", "Thorax", "Abdomen", "Pelvis", "Upper Limb", "Lower Limb", "Back"];
 const TOPICS = ["Muscles & Functions", "Nerves & Blood Supply", "Dissection Landmarks", "Anatomical Relationships"];
 const SPECIMENS = ["Typical", "Thin", "Muscular", "Obese", "Elderly"];
@@ -987,6 +1111,28 @@ const normalizeTopic = (t) => String(t || "").toLowerCase().replace(/\s+/g, " ")
 const niceTopic = (t) => (t ? t.charAt(0).toUpperCase() + t.slice(1) : t);
 
 // ---------- Due for review: steps flagged Revisit and quiz topics missed come back after 1, 3 and 7 days ----------
+// Quiz questions this browser has already shown, so a student never gets the same question twice.
+// Only the question text is kept (no names), in this browser only, and it expires like the rest of the history.
+const SEEN_KEY = "askInglisSeenQuestions";
+const SEEN_MAX = 150;
+function readSeen() {
+  try {
+    const now = Date.now();
+    const saved = JSON.parse(localStorage.getItem(SEEN_KEY) || "[]");
+    return Array.isArray(saved)
+      ? saved.filter((x) => x && typeof x.s === "string" && Number.isFinite(x.t) && now - x.t < RETENTION_MS)
+      : [];
+  } catch { return []; }
+}
+function rememberSeen(stems) {
+  try {
+    const have = new Set(readSeen().map((x) => x.s));
+    const fresh = stems.map((s) => String(s).replace(/\s+/g, " ").trim().slice(0, 200)).filter((s) => s && !have.has(s));
+    const next = [...readSeen(), ...fresh.map((s) => ({ s, t: Date.now() }))].slice(-SEEN_MAX);
+    localStorage.setItem(SEEN_KEY, JSON.stringify(next));
+  } catch { /* storage blocked: repeats are then only avoided within the conversation */ }
+}
+
 const DUE_KEY = "askInglisDue";
 const DUE_DAYS = [1, 3, 7];
 const DAY_MS = 86400000;
@@ -1384,6 +1530,23 @@ export default function App() {
   const [loadingText, setLoadingText] = useState("Thinking…");
   const [copiedId, setCopiedId] = useState(null);
   const [readingId, setReadingId] = useState(null);
+  const [translations, setTranslations] = useState({});
+  const [translateMenuId, setTranslateMenuId] = useState(null);
+  const [preferredLanguage, setPreferredLanguage] = useState(readPreferredLanguage);
+  const translationRequests = useRef(new Map());
+  const [gloss, setGloss] = useState(null);
+  const openTerm = (term, element) => {
+    const rect = element.getBoundingClientRect();
+    setGloss({ term, x: rect.left, y: rect.bottom, top: rect.top });
+  };
+  const changeLanguage = (code) => {
+    setPreferredLanguage(code);
+    try { localStorage.setItem(LANGUAGE_KEY, code); } catch { /* optional */ }
+  };
+  useEffect(() => () => {
+    for (const controller of translationRequests.current.values()) controller.abort();
+    translationRequests.current.clear();
+  }, []);
   useEffect(() => () => { if (CAN_SPEAK) window.speechSynthesis.cancel(); }, []);
   const [reviewed, setReviewed] = useState({});
   const [editingId, setEditingId] = useState(null);
@@ -1483,6 +1646,7 @@ export default function App() {
     setQuestion("");
     setEditingId(null);
     setError("");
+    setTranslateMenuId(null);
   };
 
   const newConversation = () => {
@@ -1492,10 +1656,24 @@ export default function App() {
     setQuestion("");
     setEditingId(null);
     setError("");
+    setTranslateMenuId(null);
   };
 
   const deleteConversation = (id) => {
     if (!window.confirm("Delete this conversation? This cannot be undone.")) return;
+    const doomed = conversations.find((item) => item.id === id);
+    if (doomed) {
+      for (const msg of doomed.messages) {
+        translationRequests.current.get(msg.id)?.abort();
+        translationRequests.current.delete(msg.id);
+      }
+      setTranslations((old) => {
+        const next = { ...old };
+        for (const msg of doomed.messages) delete next[msg.id];
+        return next;
+      });
+    }
+    setTranslateMenuId(null);
     setConversations((old) => {
       const remaining = old.filter((item) => item.id !== id);
       return remaining.length ? remaining : [makeConversation()];
@@ -1579,10 +1757,16 @@ export default function App() {
       const response = await fetch(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: payload, history, mode: activeMode === "dissect" ? (apiMode || "dissect") : undefined }),
+        body: JSON.stringify({
+          message: payload, history, mode: activeMode === "dissect" ? (apiMode || "dissect") : undefined,
+          session: String(conversationId), shown: shownText || undefined,
+          seen: /\bquiz\b|practice questions|another set|\bquestions\b/i.test(payload) ? readSeen().slice(-60).map((x) => x.s) : undefined,
+        }),
       });
       if (!response.ok) throw new Error(`Chat request failed (${response.status})`);
       const data = await response.json();
+      const shownQuiz = parseQuiz(data.reply);
+      if (shownQuiz) rememberSeen(shownQuiz.map((q) => q.stem));
       if (/^\*\*Score: /.test(data.reply || "")) {
         const quizMsg = [...previous].reverse().find((m) => m.role === "assistant" && parseQuiz(m.content));
         if (quizMsg) {
@@ -1661,12 +1845,77 @@ export default function App() {
   const stopReading = () => { if (CAN_SPEAK) window.speechSynthesis.cancel(); setReadingId(null); };
   const readAloud = (message) => {
     if (readingId === message.id) { stopReading(); return; }
-    const utterance = new SpeechSynthesisUtterance(speakableText(message.content));
+    const t = translations[message.id] || {};
+    const shown = LANGUAGES.find((lang) => lang.code === t.shownLanguage);
+    const utterance = new SpeechSynthesisUtterance(speakableText(shown && t.cache?.[shown.code] ? t.cache[shown.code] : message.content));
+    if (shown) utterance.lang = shown.voice;
     utterance.onend = () => setReadingId(null);
     utterance.onerror = () => setReadingId(null);
     window.speechSynthesis.cancel();
     setReadingId(message.id);
     window.speechSynthesis.speak(utterance);
+  };
+
+  const showOriginal = (messageId) => {
+    if (CAN_SPEAK) window.speechSynthesis.cancel();
+    setReadingId(null);
+    setTranslations((old) => ({ ...old, [messageId]: { ...(old[messageId] || {}), shownLanguage: null, error: null } }));
+    setTranslateMenuId(null);
+  };
+
+  const translateAnswer = async (message, languageCode) => {
+    const lang = LANGUAGES.find((item) => item.code === languageCode);
+    if (!lang) return;
+    setPreferredLanguage(lang.code);
+    try { localStorage.setItem(LANGUAGE_KEY, lang.code); } catch { /* optional */ }
+    setTranslateMenuId(null);
+    if (CAN_SPEAK) window.speechSynthesis.cancel();
+    setReadingId(null);
+
+    if (translations[message.id]?.cache?.[lang.code]) {
+      setTranslations((old) => ({
+        ...old,
+        [message.id]: { ...old[message.id], shownLanguage: lang.code, loading: false, error: null },
+      }));
+      return;
+    }
+
+    translationRequests.current.get(message.id)?.abort();
+    const controller = new AbortController();
+    translationRequests.current.set(message.id, controller);
+    setTranslations((old) => ({ ...old, [message.id]: { ...(old[message.id] || {}), loading: true, error: null } }));
+
+    try {
+      const response = await fetch(`${API_URL}/translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({ text: message.content, target_language: lang.name }),
+      });
+      if (response.status === 404 || response.status === 405) throw new Error("Translation is not available on this server yet.");
+      if (!response.ok) throw new Error(`Translation request failed (HTTP ${response.status}).`);
+      const data = await response.json();
+      const translated = typeof data.translated_text === "string" ? data.translated_text.trim() : "";
+      if (!translated) throw new Error("The translation service returned an empty result.");
+      if (controller.signal.aborted) return;
+      setTranslations((old) => ({
+        ...old,
+        [message.id]: {
+          ...(old[message.id] || {}),
+          cache: { ...(old[message.id]?.cache || {}), [lang.code]: translated },
+          shownLanguage: lang.code, loading: false, error: null,
+        },
+      }));
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      console.error("Translation failed:", err);
+      setTranslations((old) => ({
+        ...old,
+        [message.id]: { ...(old[message.id] || {}), loading: false, error: err.message || "Translation is temporarily unavailable." },
+      }));
+    } finally {
+      if (translationRequests.current.get(message.id) === controller) translationRequests.current.delete(message.id);
+    }
   };
 
   const copyAnswer = async (message) => {
@@ -1805,6 +2054,7 @@ export default function App() {
   };
 
   return (
+    <GlossaryContext.Provider value={openTerm}>
     <div className="app-shell" data-printing={printIds ? "true" : undefined}>
       <aside className="sidebar">
         <div className="brand">
@@ -1844,6 +2094,9 @@ export default function App() {
         <p className="retention-note">
           Conversations and missed-question lists are removed from this browser after {RETENTION_DAYS} days
           without new activity.
+        </p>
+        <p className="retention-note">
+          Questions and answers are saved without your name so the instructor can improve the course notes.
         </p>
       </aside>
 
@@ -1926,6 +2179,10 @@ export default function App() {
             const quiz = message.role === "assistant" ? parseQuiz(message.content) : null;
             const isGraded = /^\*\*Score: /.test(message.content || "");
             const topic = topicFrom(message.question);
+            const canTranslate = message.role === "assistant" && !message.local && !quiz && !isGraded && !message.mode;
+            const tr = translations[message.id] || {};
+            const shownLang = canTranslate ? LANGUAGES.find((lang) => lang.code === tr.shownLanguage) : null;
+            const shownText = shownLang && tr.cache?.[shownLang.code] ? tr.cache[shownLang.code] : null;
             return (
             <Fragment key={message.id}>
             {messages.length > CONTEXT_MESSAGES && index === messages.length - CONTEXT_MESSAGES && (
@@ -1954,7 +2211,12 @@ export default function App() {
                                 <GradeBreakdown reply={message.content} confidence={messages[index - 1]?.confidence} />
                                 <FormattedAnswer content={highlightChoice(message.content)} />
                               </>
-                            : <FormattedAnswer content={message.content} />}
+                            : <>
+                                {shownText && (
+                                  <div className="translation-label" role="status">🌐 Translated to {shownLang.name} · AI translation. Anatomical terms stay in English.</div>
+                                )}
+                                <FormattedAnswer content={shownText || message.content} />
+                              </>}
                         {message.images?.[0]?.url && <Figure image={message.images[0]} />}
                       </>)
                   : <div className="user-text">
@@ -2000,7 +2262,33 @@ export default function App() {
                       <button type="button" title="Print or save as a study sheet" aria-label="Print or save as a study sheet"
                         onClick={() => printSheet(index)}>🖨</button>
                       {message.feedback && <span>Feedback submitted</span>}
+                      {canTranslate && (
+                        <div className="translate-actions">
+                          {tr.shownLanguage && (
+                            <button className="translate-control" type="button" onClick={() => showOriginal(message.id)} disabled={tr.loading}>Original</button>
+                          )}
+                          <button className="translate-control translate-primary" type="button" aria-expanded={translateMenuId === message.id}
+                            aria-label="Translate answer" disabled={Boolean(tr.loading)}
+                            onClick={() => setTranslateMenuId((id) => (id === message.id ? null : message.id))}>
+                            {tr.loading ? "Translating…" : "🌐 Translate"}
+                          </button>
+                          {translateMenuId === message.id && (
+                            <div className="translate-menu" role="group" aria-label="Choose translation language">
+                              <div className="translate-menu-heading">Translate answer to</div>
+                              {LANGUAGES.map((lang) => (
+                                <button key={lang.code} type="button"
+                                  className={lang.code === preferredLanguage ? "translate-language preferred" : "translate-language"}
+                                  onClick={() => void translateAnswer(message, lang.code)}>
+                                  {lang.label}
+                                  {lang.code === preferredLanguage && <span aria-hidden="true">✓</span>}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
+                    {tr.error && canTranslate && <p className="translate-error" role="alert">{tr.error}</p>}
                     {isLatest && !message.local && !message.degraded && !quiz && (
                       <div className="chips">
                         {isGraded ? (
@@ -2099,6 +2387,7 @@ export default function App() {
         </>)}
       </main>
       <LabBench open={benchOpen} seed={benchSeed} onClose={() => setBenchOpen(false)} onSave={saveBenchSummary} onQuiz={quizFromBench} />
+      {gloss && <TermPopup gloss={gloss} language={preferredLanguage} onLanguage={changeLanguage} onClose={() => setGloss(null)} apiUrl={API_URL} />}
 
       {feedbackTarget && (
         <div className="modal-overlay" role="presentation">
@@ -2120,5 +2409,6 @@ export default function App() {
         </div>
       )}
     </div>
+    </GlossaryContext.Provider>
   );
 }

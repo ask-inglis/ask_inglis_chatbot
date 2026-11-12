@@ -63,6 +63,8 @@ from retrieval import search_notes
 from protect import allowed_origins, rate_limit, daily_cap
 from cache import cache_get, cache_put, cache_clear
 from typos import build_vocabulary, correct_query
+import chatlog
+from quizgate import quiz_gate, BUSY_REPLY
 from insights import (
     load_insights,
     mark_reviewed,
@@ -137,6 +139,8 @@ limit_chat = rate_limit("chat", int(os.environ.get("CHAT_PER_MIN", "40")), 60)
 limit_feedback = rate_limit("feedback", int(os.environ.get("FEEDBACK_PER_MIN", "40")), 60)
 limit_images = rate_limit("images", int(os.environ.get("IMAGES_PER_MIN", "80")), 60)
 limit_title = rate_limit("title", int(os.environ.get("TITLE_PER_MIN", "30")), 60)
+limit_translate = rate_limit("translate", int(os.environ.get("TRANSLATE_PER_MIN", "20")), 60)
+limit_gloss = rate_limit("gloss", int(os.environ.get("GLOSS_PER_MIN", "40")), 60)
 daily_chat_cap = daily_cap(int(os.environ.get("DAILY_CHAT_LIMIT", "0")))
 
 
@@ -167,12 +171,13 @@ if not PROVIDER_READY[LLM_PROVIDER]:
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 
 
-def call_openai_style(client, model_name, prompt, max_tokens, label):
+def call_openai_style(client, model_name, prompt, max_tokens, label, extra=None):
     start = time.time()
     response = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
+        **({"extra_body": extra} if extra else {}),
     )
     print(f"{label} {model_name}: {time.time() - start:.1f}s, usage={getattr(response, 'usage', None)}")
     return (response.choices[0].message.content or "").strip()
@@ -224,8 +229,18 @@ def generate(prompt: str) -> str:
         raise
 
 
+QUIZ_REASONING_EFFORT = os.environ.get("QUIZ_REASONING_EFFORT", "").strip().lower()  # low, medium or high; blank = model default
+
+
 def generate_quiz(prompt: str) -> str:
-    """Same as generate(), but uses GEMINI_QUIZ_MODEL first when Gemini is the provider and one is set."""
+    """Same as generate(), but uses GEMINI_QUIZ_MODEL first when Gemini is the provider and one is set.
+    With BullsAI, QUIZ_REASONING_EFFORT=low asks the model to think less, which makes quiz writing much faster."""
+    if LLM_PROVIDER == "bullsai" and QUIZ_REASONING_EFFORT and bullsai_client is not None:
+        try:
+            return call_openai_style(bullsai_client, BULLSAI_MODEL_NAME, prompt, BULLSAI_MAX_TOKENS,
+                                     f"BullsAI quiz ({QUIZ_REASONING_EFFORT})", {"reasoning_effort": QUIZ_REASONING_EFFORT})
+        except Exception as e:
+            print(f"Quiz call with reasoning_effort failed, using the normal call: {e}")
     if LLM_PROVIDER == "gemini" and GEMINI_QUIZ_MODEL and gemini_client is not None:
         return call_gemini(prompt, first_model=GEMINI_QUIZ_MODEL)
     return generate(prompt)
@@ -291,6 +306,9 @@ class ChatRequest(BaseModel):
     message: str = Field(max_length=2000)
     history: list[Turn] = Field(default_factory=list, max_length=12)
     mode: str = Field(default="", max_length=16)  # "dissect" = layered guide, "locate" = Where am I?
+    session: str = Field(default="", max_length=40)  # random conversation id made by the browser, for grouping only
+    seen: list[str] = Field(default_factory=list, max_length=80)  # stems of quiz questions this browser already showed the student
+    shown: str = Field(default="", max_length=600)   # the short question the student actually saw, if the page sent a longer prompt
 
 
 class TitleRequest(BaseModel):
@@ -300,6 +318,32 @@ class TitleRequest(BaseModel):
 
 class TitleResponse(BaseModel):
     title: str
+
+
+# Languages the frontend offers for translating an answer (display name sent by the page)
+TRANSLATE_LANGUAGES = {
+    "Korean", "Spanish", "Simplified Chinese", "Japanese", "French",
+    "German", "Hindi", "Arabic", "Portuguese", "Vietnamese",
+}
+
+
+class TranslateRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=12000)  # an answer already shown to the student
+    target_language: str = Field(min_length=2, max_length=40)
+
+
+class TranslateResponse(BaseModel):
+    translated_text: str
+
+
+class GlossRequest(BaseModel):
+    term: str = Field(min_length=2, max_length=80)  # a short bold term the student tapped
+    target_language: str = Field(min_length=2, max_length=40)
+
+
+class GlossResponse(BaseModel):
+    translation: str
+    meaning: str
 
 
 class ChatResponse(BaseModel):
@@ -425,12 +469,7 @@ Standalone question:"""
         return message
 
 
-@app.post(
-    "/chat",
-    response_model=ChatResponse,
-    dependencies=[Depends(require_ready), Depends(limit_chat), Depends(daily_chat_cap)],
-)
-def chat(request: ChatRequest, background: BackgroundTasks):
+def _chat_impl(request: ChatRequest, background: BackgroundTasks):
     t0 = time.time()
 
     # "That's wrong": no self-correction. Queue it for a human and tell the student.
@@ -451,14 +490,21 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         intent = quiz_intent(request.message, prev[0].content if prev else "", bool(items) or seen_quiz)
 
         if intent["kind"] == "new":
+            waiting_now = quiz_gate.waiting
+            if not quiz_gate.enter():
+                print(f"Quiz busy: {waiting_now} waiting, asked to try again")
+                return ChatResponse(reply=BUSY_REPLY, sources=[], lectures=[], degraded=True)
             try:
                 batch = generate_questions(
                     intent["topic"], intent["count"], generate_quiz,
-                    avoid=[i["stem"] for i in items] if items else None,  # don't repeat the last quiz
+                    # don't repeat the last quiz, or any question this browser has already shown the student
+                    avoid=list(dict.fromkeys([i["stem"] for i in items] + [str(x)[:300] for x in request.seen])) or None,
                 )
             except Exception as e:
                 print(f"Quiz generation failed: {e}")
                 raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+            finally:
+                quiz_gate.leave()
             print(
                 f"Quiz: {len(batch['items'])} accepted, {len(batch['rejected'])} rejected "
                 f"in {time.time() - t0:.1f}s"
@@ -544,11 +590,16 @@ def chat(request: ChatRequest, background: BackgroundTasks):
 
     # Only the student's own words decide whether a body type was mentioned
     student_text = " ".join([t.content for t in request.history if t.role == "user"] + [request.message])
-    if BODY_TYPE_PATTERN.search(student_text):
+    body_words = list(dict.fromkeys(m.group(1).lower() for m in BODY_TYPE_PATTERN.finditer(student_text)))
+    if body_words:
+        named = ", ".join(body_words)
         body_rule = (
-            'The student mentioned a body type or specimen. You MUST end your answer with a section titled exactly '
+            f'The student named this body type or specimen: {named}. You MUST end your answer with a section titled '
             '"**Body type note**" containing 2 to 3 bullets on how the approach, landmarks, depth, or the '
-            "structure's size and position change for that body type. Use body type details from earlier in the conversation."
+            f"structure's size and position change for {named} specimens, for the structures in this answer. "
+            "Write only about the body type the student named, and do not discuss any other body type. "
+            'Never write that no body type was given, because it was. Do not hedge about the body type itself; if one '
+            'detail is uncertain, start that bullet with "General knowledge:".'
         )
     else:
         body_rule = (
@@ -683,6 +734,22 @@ Answer:"""
 
 # ---------- Images ----------
 
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    dependencies=[Depends(require_ready), Depends(limit_chat), Depends(daily_chat_cap)],
+)
+def chat(request: ChatRequest, background: BackgroundTasks):
+    t0 = time.time()
+    response = _chat_impl(request, background)
+    background.add_task(
+        chatlog.log_exchange,
+        request.session, request.mode, request.shown or request.message,
+        response.reply, response.lectures, int((time.time() - t0) * 1000),
+    )
+    return response
+
+
 def _clean_title(text: str, fallback: str) -> str:
     title = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
     title = re.sub(r"^\W*title\s*:\s*", "", title.replace("*", ""), flags=re.IGNORECASE)
@@ -713,6 +780,80 @@ Title:"""
     except Exception as e:
         print(f"Title generation failed: {e}")
         return TitleResponse(title=_clean_title("", fallback))
+
+
+@app.post("/translate", response_model=TranslateResponse, dependencies=[Depends(limit_translate)])
+def translate_text(req: TranslateRequest):
+    """Translate an answer the student is already looking at. The English answer stays on screen as the
+    reference, so this is display-only. Anatomical terms stay in English so they match the exam."""
+    language = req.target_language.strip()
+    if language not in TRANSLATE_LANGUAGES:
+        raise HTTPException(status_code=422, detail="Unsupported language.")
+    cache_key = f"[translate:{language}] {req.text}"
+    cached = cache_get(cache_key)
+    if cached and cached.get("translated_text"):
+        return TranslateResponse(translated_text=cached["translated_text"])
+    prompt = f"""Translate the anatomy study answer below into {language}.
+
+Rules:
+- Keep the exact structure: headings, bullet points, numbered lists and bold text stay as they are.
+- Keep every anatomical term in English (or its Latin name), for example "biceps brachii" or "musculocutaneous nerve",
+  because the student's exams are in English. Right after a term you may add its {language} name in brackets,
+  the first time it appears only.
+- Do not translate lecture or file names, numbers, or the markers "General knowledge:" and "Body type note"
+  (translate the words after them).
+- Do not add, remove, correct or explain anything. If a sentence looks wrong, translate it as it is.
+- Return only the translation, with no introduction and no notes.
+
+Answer to translate:
+{req.text}"""
+    try:
+        translated = (generate(prompt) or "").strip()
+    except Exception as e:
+        print(f"Translation failed: {e}")
+        raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+    if not translated:
+        raise HTTPException(status_code=502, detail="The AI service returned an empty translation.")
+    cache_put(cache_key, {"translated_text": translated})
+    return TranslateResponse(translated_text=translated)
+
+
+@app.post("/gloss", response_model=GlossResponse, dependencies=[Depends(limit_gloss)])
+def gloss_term(req: GlossRequest):
+    """A small glossary entry for one term: its name in the student's language plus a plain-English meaning.
+    The lab steps and quizzes stay in English; this only helps a learner understand the word."""
+    language = req.target_language.strip()
+    term = " ".join(req.term.split())
+    if language not in TRANSLATE_LANGUAGES:
+        raise HTTPException(status_code=422, detail="Unsupported language.")
+    cache_key = f"[gloss:{language}] {term.lower()}"
+    cached = cache_get(cache_key)
+    if cached and cached.get("translation"):
+        return GlossResponse(translation=cached["translation"], meaning=cached.get("meaning", ""))
+    prompt = f"""A first-year anatomy student is learning the English term "{term}".
+
+Reply in exactly two lines and nothing else:
+TRANSLATION: the term in {language} (the usual word used for it in {language}; if there is no common word, give a short description in {language})
+MEANING: one short sentence in simple English saying what it is or does (maximum 20 words)
+
+If "{term}" is not an anatomy or dissection term, reply with only: NOT A TERM"""
+    try:
+        raw = (generate(prompt) or "").strip()
+    except Exception as e:
+        print(f"Gloss failed: {e}")
+        raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+    translation = meaning = ""
+    for line in raw.splitlines():
+        head, _, rest = line.partition(":")
+        key = head.strip().strip("*").upper()
+        if key == "TRANSLATION":
+            translation = rest.strip().strip("*").strip()
+        elif key == "MEANING":
+            meaning = rest.strip().strip("*").strip()
+    if not translation:
+        raise HTTPException(status_code=404, detail="No glossary entry for that term.")
+    cache_put(cache_key, {"translation": translation, "meaning": meaning})
+    return GlossResponse(translation=translation, meaning=meaning)
 
 
 @app.get("/images", dependencies=[Depends(limit_images)])
@@ -853,6 +994,30 @@ def resolve(feedback_id: str, req: ResolveRequest):
 
 
 # ---------- Instructor review badge and weekly report ----------
+
+@app.get("/admin/chatlog", dependencies=[Depends(require_admin)])
+def admin_chatlog(days: int = 7, q: str = "", mode: str = "", limit: int = 200):
+    """Recent questions and answers, newest first. Filter with q (text) and mode."""
+    return {"records": chatlog.read_log(days, q, mode, limit)}
+
+
+@app.get("/admin/chatlog.csv", dependencies=[Depends(require_admin)])
+def admin_chatlog_csv(days: int = 30, q: str = "", mode: str = ""):
+    return Response(
+        content=chatlog.to_csv(chatlog.read_log(days, q, mode, 2000)),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="askinglis-chatlog.csv"'},
+    )
+
+
+@app.get("/admin/chatlog.xlsx", dependencies=[Depends(require_admin)])
+def admin_chatlog_xlsx(days: int = 90, q: str = "", mode: str = ""):
+    return Response(
+        content=chatlog.to_xlsx(chatlog.read_log(days, q, mode, 20000)),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="askinglis-chatlog.xlsx"'},
+    )
+
 
 @app.get("/reviewed", dependencies=[Depends(limit_images)])
 def reviewed():
