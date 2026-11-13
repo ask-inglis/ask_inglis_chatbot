@@ -1,0 +1,28 @@
+# Run the whole app on one machine:   docker compose up --build
+# Settings are read from backend/.env (the same file you use when running without Docker). Never commit it.
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_store:/app/chroma_store   # search index, so restarts are quick
+      - chatlog:/app/chatlog             # today's chat log before it is copied to the notes repo
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # The address students' browsers use to reach the backend (written into the site when built).
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://localhost:8000}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  chroma_store:
+  chatlog:

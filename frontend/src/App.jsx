@@ -2,7 +2,7 @@ import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import "./App.css";
 import "./GuidedStudy.css";
-import "./AnatomyTheme.css";
+import "./Anatomytheme.css";
 import "./Translation.css";
 
 const API_URL = (

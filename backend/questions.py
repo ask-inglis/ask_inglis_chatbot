@@ -209,6 +209,21 @@ def _shuffle_options(item: dict) -> dict:
     return item
 
 
+STYLE_FILE = os.environ.get("QUIZ_STYLE_FILE", "").strip()
+
+
+def _style_notes() -> str:
+    """Optional short note on how the course director phrases questions, written in our own words.
+    Set QUIZ_STYLE_FILE to its path. Missing or unreadable means no note. Capped so it cannot bloat the prompt."""
+    if not STYLE_FILE:
+        return ""
+    try:
+        with open(STYLE_FILE, encoding="utf-8") as f:
+            return f.read().strip()[:1500]
+    except OSError:
+        return ""
+
+
 def _build_prompt(topic: str, n: int, notes: str, avoid: list[str], rules: str) -> str:
     letters = LETTERS[:OPTIONS_PER_QUESTION]
     example_options = ", ".join(f'"{l}": "..."' for l in letters)
@@ -222,6 +237,11 @@ def _build_prompt(topic: str, n: int, notes: str, avoid: list[str], rules: str) 
             "\nExcerpts from the official NBME item-writing guide. If they differ from the short rules above, "
             "follow the guide:\n" + rules + "\n"
         )
+    style = _style_notes()
+    style_block = (
+        "\nHouse style (about HOW questions are phrased only: form, tone, length and how wrong options are built). "
+        "Follow the form. Never copy facts or wording from it:\n" + style + "\n"
+    ) if style else ""
     return f"""Write {n} single-best-answer multiple-choice questions for UB anatomy students about: {topic}
 Use ONLY the course notes below. Write as many good questions as the notes support, up to {n}. Fewer is fine.
 Return an empty array [] only if the notes contain nothing at all about the topic.
@@ -245,7 +265,7 @@ Item-writing rules (NBME style):
 - Every option, right or wrong, must be a real anatomical structure, term, finding or sign that a student could meet in the course. Never invent a term to fill a slot, and never use a function or action as an option when the other options are structures.
 - The question must be anatomically accurate and have only one defensible answer. If another option could also be argued as correct from the notes, choose a different question.
 - Never mention option letters (A, B, C...) in the explanation, notes or tip. Refer to options by name, because the order is shuffled afterwards.
-{rules_block}
+{rules_block}{style_block}
 Return ONLY a JSON array, with no other text. Each item looks like:
 {{"stem": "...", "options": {{{example_options}}}, "answer": "C", "explanation": "one or two sentences on why the correct answer is right", "option_notes": {{{example_notes}}}, "study_tip": "one sentence", "lecture": "exact lecture name from the notes label"}}
 {avoid_block}
