@@ -9,3 +9,5 @@ python-docx
 PyGithub
 python-dotenv
 pypdf
+openpyxl
+python-pptx

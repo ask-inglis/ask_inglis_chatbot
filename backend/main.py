@@ -62,6 +62,18 @@ from questions import (
 from retrieval import search_notes
 from protect import allowed_origins, rate_limit, daily_cap
 from cache import cache_get, cache_put, cache_clear
+from typos import build_vocabulary, correct_query
+import chatlog
+from quizgate import quiz_gate, BUSY_REPLY
+from insights import (
+    load_insights,
+    mark_reviewed,
+    reviewed_lectures,
+    record_answer,
+    record_quiz_grade,
+    flush_usage,
+    build_report,
+)
 
 app = FastAPI(title="AskInglis Backend")
 
@@ -127,6 +139,8 @@ limit_chat = rate_limit("chat", int(os.environ.get("CHAT_PER_MIN", "40")), 60)
 limit_feedback = rate_limit("feedback", int(os.environ.get("FEEDBACK_PER_MIN", "40")), 60)
 limit_images = rate_limit("images", int(os.environ.get("IMAGES_PER_MIN", "80")), 60)
 limit_title = rate_limit("title", int(os.environ.get("TITLE_PER_MIN", "30")), 60)
+limit_translate = rate_limit("translate", int(os.environ.get("TRANSLATE_PER_MIN", "20")), 60)
+limit_gloss = rate_limit("gloss", int(os.environ.get("GLOSS_PER_MIN", "40")), 60)
 daily_chat_cap = daily_cap(int(os.environ.get("DAILY_CHAT_LIMIT", "0")))
 
 
@@ -157,12 +171,13 @@ if not PROVIDER_READY[LLM_PROVIDER]:
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 
 
-def call_openai_style(client, model_name, prompt, max_tokens, label):
+def call_openai_style(client, model_name, prompt, max_tokens, label, extra=None):
     start = time.time()
     response = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
+        **({"extra_body": extra} if extra else {}),
     )
     print(f"{label} {model_name}: {time.time() - start:.1f}s, usage={getattr(response, 'usage', None)}")
     return (response.choices[0].message.content or "").strip()
@@ -214,8 +229,18 @@ def generate(prompt: str) -> str:
         raise
 
 
+QUIZ_REASONING_EFFORT = os.environ.get("QUIZ_REASONING_EFFORT", "").strip().lower()  # low, medium or high; blank = model default
+
+
 def generate_quiz(prompt: str) -> str:
-    """Same as generate(), but uses GEMINI_QUIZ_MODEL first when Gemini is the provider and one is set."""
+    """Same as generate(), but uses GEMINI_QUIZ_MODEL first when Gemini is the provider and one is set.
+    With BullsAI, QUIZ_REASONING_EFFORT=low asks the model to think less, which makes quiz writing much faster."""
+    if LLM_PROVIDER == "bullsai" and QUIZ_REASONING_EFFORT and bullsai_client is not None:
+        try:
+            return call_openai_style(bullsai_client, BULLSAI_MODEL_NAME, prompt, BULLSAI_MAX_TOKENS,
+                                     f"BullsAI quiz ({QUIZ_REASONING_EFFORT})", {"reasoning_effort": QUIZ_REASONING_EFFORT})
+        except Exception as e:
+            print(f"Quiz call with reasoning_effort failed, using the normal call: {e}")
     if LLM_PROVIDER == "gemini" and GEMINI_QUIZ_MODEL and gemini_client is not None:
         return call_gemini(prompt, first_model=GEMINI_QUIZ_MODEL)
     return generate(prompt)
@@ -239,11 +264,26 @@ def _warm_up():
         print(f"Startup rebuild: {rebuild_from_backups()}")
         print(f"Image catalog: {rebuild_images()} images")
         print(f"NBME guide: {rebuild_guides()} chunks")
+        print(f"Insights: {load_insights()}")
+        print(f"Spelling vocabulary: {rebuild_vocabulary()} words")
     except Exception as e:
         print(f"Warm-up failed: {e}")
     finally:
         state["ready"] = True
         print(f"Warm-up finished in {time.time() - start:.0f}s")
+
+
+# "Compare the brachialis and the biceps", "difference between X and Y", "X vs Y"
+COMPARE_PATTERN = re.compile(r"\b(compare|comparison|differences?\s+(?:between|of)|versus|vs\.?)\b", re.I)
+
+
+def rebuild_vocabulary() -> int:
+    """Words from the notes, used to catch typos in a student's question."""
+    try:
+        return build_vocabulary(collection.get(include=["documents"])["documents"])
+    except Exception as e:
+        print(f"Spelling vocabulary failed: {e}")
+        return 0
 
 
 def require_ready():
@@ -265,6 +305,10 @@ class Turn(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(max_length=2000)
     history: list[Turn] = Field(default_factory=list, max_length=12)
+    mode: str = Field(default="", max_length=16)  # "dissect" = layered guide, "locate" = Where am I?
+    session: str = Field(default="", max_length=40)  # random conversation id made by the browser, for grouping only
+    seen: list[str] = Field(default_factory=list, max_length=80)  # stems of quiz questions this browser already showed the student
+    shown: str = Field(default="", max_length=600)   # the short question the student actually saw, if the page sent a longer prompt
 
 
 class TitleRequest(BaseModel):
@@ -276,12 +320,39 @@ class TitleResponse(BaseModel):
     title: str
 
 
+# Languages the frontend offers for translating an answer (display name sent by the page)
+TRANSLATE_LANGUAGES = {
+    "Korean", "Spanish", "Simplified Chinese", "Japanese", "French",
+    "German", "Hindi", "Arabic", "Portuguese", "Vietnamese",
+}
+
+
+class TranslateRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=12000)  # an answer already shown to the student
+    target_language: str = Field(min_length=2, max_length=40)
+
+
+class TranslateResponse(BaseModel):
+    translated_text: str
+
+
+class GlossRequest(BaseModel):
+    term: str = Field(min_length=2, max_length=80)  # a short bold term the student tapped
+    target_language: str = Field(min_length=2, max_length=40)
+
+
+class GlossResponse(BaseModel):
+    translation: str
+    meaning: str
+
+
 class ChatResponse(BaseModel):
     reply: str
     sources: list[str]
     lectures: list[str] = []
     images: list[dict] = []
     degraded: bool = False  # true when the AI was unavailable and note excerpts were returned
+    understood_as: str | None = None  # the question after obvious spelling fixes, when anything was fixed
 
 
 class FeedbackRequest(BaseModel):
@@ -398,12 +469,7 @@ Standalone question:"""
         return message
 
 
-@app.post(
-    "/chat",
-    response_model=ChatResponse,
-    dependencies=[Depends(require_ready), Depends(limit_chat), Depends(daily_chat_cap)],
-)
-def chat(request: ChatRequest, background: BackgroundTasks):
+def _chat_impl(request: ChatRequest, background: BackgroundTasks):
     t0 = time.time()
 
     # "That's wrong": no self-correction. Queue it for a human and tell the student.
@@ -424,14 +490,21 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         intent = quiz_intent(request.message, prev[0].content if prev else "", bool(items) or seen_quiz)
 
         if intent["kind"] == "new":
+            waiting_now = quiz_gate.waiting
+            if not quiz_gate.enter():
+                print(f"Quiz busy: {waiting_now} waiting, asked to try again")
+                return ChatResponse(reply=BUSY_REPLY, sources=[], lectures=[], degraded=True)
             try:
                 batch = generate_questions(
                     intent["topic"], intent["count"], generate_quiz,
-                    avoid=[i["stem"] for i in items] if items else None,  # don't repeat the last quiz
+                    # don't repeat the last quiz, or any question this browser has already shown the student
+                    avoid=list(dict.fromkeys([i["stem"] for i in items] + [str(x)[:300] for x in request.seen])) or None,
                 )
             except Exception as e:
                 print(f"Quiz generation failed: {e}")
                 raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+            finally:
+                quiz_gate.leave()
             print(
                 f"Quiz: {len(batch['items'])} accepted, {len(batch['rejected'])} rejected "
                 f"in {time.time() - t0:.1f}s"
@@ -440,6 +513,8 @@ def chat(request: ChatRequest, background: BackgroundTasks):
             # list only the lectures the questions came from, not every lecture the search touched
             used = list(dict.fromkeys(i["lecture"] for i in new_items if i["lecture"])) or batch["lectures"]
             quiz_reply = format_quiz_for(new_items, intent["with_answers"])
+            if new_items:
+                record_answer(used, "quiz")
             if new_items:
                 remember_quiz(quiz_reply, new_items)
                 remember_answer(quiz_reply, used)
@@ -453,10 +528,13 @@ def chat(request: ChatRequest, background: BackgroundTasks):
                 picks = parse_picks(request.message, len(items))
                 if picks:
                     reply = grade_answers(items, picks)
+                    record_quiz_grade(items, picks)
             if reply:
                 quiz_lectures = list(dict.fromkeys(i["lecture"] for i in items if i["lecture"]))
                 remember_answer(reply, quiz_lectures)
-                return ChatResponse(reply=reply, sources=[], lectures=quiz_lectures)
+                # Note passages are shown only now, after grading or "show answers": next to an unanswered question they could give it away.
+                passages = [i["evidence"][:700] for i in items if i.get("evidence")]
+                return ChatResponse(reply=reply, sources=passages, lectures=quiz_lectures)
         elif seen_quiz and (intent["kind"] == "answers" or parse_picks(request.message, 10)):
             return ChatResponse(
                 reply=(
@@ -479,14 +557,21 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         )
 
     # First questions (no history) can be answered from the cache
-    cacheable = not request.history
+    # Same topic, same lab guide: dissection guides are cached by topic so every student (and every retry) sees
+    # the same steps. "Where am I?" answers depend on the student's own words, so they are never cached.
+    cacheable = not request.history and request.mode != "locate"
+    cache_key = f"[{request.mode}] {request.message}" if request.mode else request.message
     if cacheable:
-        hit = cache_get(request.message)
+        hit = cache_get(cache_key)
         if hit:
             print(f"Cache hit after {time.time() - t0:.2f}s")
+            record_answer(hit.get("lectures", []), "chat")
             return ChatResponse(**hit)
 
-    query = standalone_question(request.message, request.history)
+    typed, fixes = correct_query(request.message)  # "brachilais" -> "brachialis", only when clearly a typo
+    if fixes:
+        print(f"Spelling fixed: {fixes}")
+    query = standalone_question(typed, request.history)
 
     docs, metas, dists = search_notes(query, n=4, ratio=RETRIEVAL_DISTANCE_RATIO)
     if dists:
@@ -505,18 +590,26 @@ def chat(request: ChatRequest, background: BackgroundTasks):
 
     # Only the student's own words decide whether a body type was mentioned
     student_text = " ".join([t.content for t in request.history if t.role == "user"] + [request.message])
-    if BODY_TYPE_PATTERN.search(student_text):
+    body_words = list(dict.fromkeys(m.group(1).lower() for m in BODY_TYPE_PATTERN.finditer(student_text)))
+    if body_words:
+        named = ", ".join(body_words)
         body_rule = (
-            'The student mentioned a body type or specimen. You MUST end your answer with a section titled exactly '
+            f'The student named this body type or specimen: {named}. You MUST end your answer with a section titled '
             '"**Body type note**" containing 2 to 3 bullets on how the approach, landmarks, depth, or the '
-            "structure's size and position change for that body type. Use body type details from earlier in the conversation."
+            f"structure's size and position change for {named} specimens, for the structures in this answer. "
+            "Write only about the body type the student named, and do not discuss any other body type. "
+            'Never write that no body type was given, because it was. Do not hedge about the body type itself; if one '
+            'detail is uncertain, start that bullet with "General knowledge:".'
         )
     else:
         body_rule = (
-            'Unless the question only asks for a name or a definition, end your answer with a section titled exactly '
+            'Unless the question only asks for a name or a definition, or is a general overview of a whole system '
+            "or topic (for example 'what does the digestive system do'), end your answer with a section titled exactly "
             '"**Body type note**" with 1 to 2 bullets. Say how the approach, landmarks, depth, or the structure\'s '
             "size and position typically vary between bodies (for example slender, obese, elderly, small or large "
             "frame, or common anatomical variants) and what that changes at the dissection table. "
+            "Only add the note when it is about a specific structure or region the question names, and leave it out "
+            "rather than write something generic. "
             'If the notes do not cover it, start that bullet with "General knowledge:". '
             "If a difference could mean an abnormality, say so and tell the student to check with their instructor."
         )
@@ -527,24 +620,71 @@ def chat(request: ChatRequest, background: BackgroundTasks):
         'Use "General knowledge:" only for facts that are not in the notes.'
     )
 
+    if request.mode == "locate":
+        # "Where am I?": the student describes what they see, in words. Never a photo.
+        format_rules = (
+            "- Start with one bold line: Most likely: <structure or region>, then (confident), (possible) or (not sure).\n"
+            "- **Confirm it:** 2 to 3 bullets, each a landmark or feature to check that tells it apart from look-alikes.\n"
+            "- **Look next:** 1 to 2 bullets on what lies next to it or deeper, and what to expose next.\n"
+            "- **Careful:** 1 bullet on what not to cut or damage here.\n"
+            "- **If it does not match:** 1 bullet naming what else it could be.\n"
+            "- If the description is too vague to place, do not guess. Say so and ask for 2 specific details "
+            "(for example direction of the fibres, nearby bone, or depth).\n"
+            "- A text description is never proof. End with exactly: Confirm with your instructor or atlas before cutting.\n"
+            "- Put structure names in **bold**. Start anything that is not in the notes with \"General knowledge:\". "
+            "Do not add a Body type note."
+        )
+    elif request.mode == "dissect":
+        # Layered dissection guide: every step says what to expect, what to protect, and what to do if lost
+        format_rules = (
+            "- Start with one bold line naming the region and what the student will expose.\n"
+            "- Then 4 to 7 numbered steps (1. 2. 3.). Each step is one action at the table, under 25 words.\n"
+            "- Under EVERY step add exactly three indented lines, each starting with a dash and one of these labels:\n"
+            "   - You should see: what is visible once the step is done, under 20 words.\n"
+            "   - Do not cut: the structure to protect at this step, or write: Nothing critical at this step.\n"
+            "   - Can't find it? one practical tip, under 20 words.\n"
+            "- Put structure names in **bold**. Use the dissection guides and lecture notes. Start anything that is "
+            "not in them with \"General knowledge:\".\n"
+            f"- After the steps: {body_rule}"
+        )
+    elif COMPARE_PATTERN.search(typed):
+        # A side-by-side table: students compare structures all the time (origin, nerve, action...)
+        format_rules = (
+            "- Start with one bold line that states the main difference.\n"
+            "- Then ONE markdown table. The first column is called Feature, then one column per structure (at most 3).\n"
+            "- Use 4 to 6 rows chosen from: Location, Origin, Insertion, Action, Nerve supply, Blood supply, "
+            "What to look for at the table. Use only rows the notes support.\n"
+            '- Keep every cell under 12 words. If the notes do not cover a cell, write "Not in the notes", or start '
+            'it with "General knowledge:" for a fact that is not in the notes.\n'
+            "- Put structure names in **bold**. After the table, add one bullet on how students mix them up.\n"
+            "- Do not add a Body type note unless the student asked about a body type."
+        )
+        if BODY_TYPE_PATTERN.search(student_text):
+            format_rules += f"\n- {body_rule}"
+    else:
+        format_rules = (
+            "- Start with one bold line that answers the question directly.\n"
+            '- Then give 3 to 6 short bullet points, each under 20 words. Use "-" for bullets.\n'
+            "- Put structure names in **bold**.\n"
+            "- Never write a paragraph longer than two sentences. Keep the main answer under 150 words unless the "
+            "student asks for more detail; the Body type note is extra.\n"
+            f"- {body_rule}"
+        )
+
     prompt = f"""You are a study assistant for UB Human Anatomy Laboratory students who are skimming at the dissection table.
 Use the notes below as your primary source. Each note excerpt starts with the lecture it came from, in [brackets].
 Don't contradict the notes. If the notes don't cover something, add a bullet that starts with "General knowledge:" and say so.
 Excerpts from files named "Class NN" are dissection guides. Use them for what to do at the table, and the lecture notes for the anatomy itself.
 
 FORMAT (very important):
-- Start with one bold line that answers the question directly.
-- Then give 3 to 6 short bullet points, each under 20 words. Use "-" for bullets.
-- Put structure names in **bold**.
-- Never write a paragraph longer than two sentences. Keep the main answer under 150 words unless the student asks for more detail; the Body type note is extra.
-- {body_rule}
+{format_rules}
 - If you are not confident about a specific difference, say so. If a difference could mean an abnormality, say that and tell the
   student to check with their instructor.
 
 Notes:
 {context}
 {history_block}
-Question: {request.message}
+Question: {typed}
 
 Answer:"""
 
@@ -575,6 +715,7 @@ Answer:"""
         reply = "- I couldn't generate an answer for that.\n- Please try rephrasing your question."
     else:
         remember_answer(reply, lectures)  # so a later "that's wrong" can name these lectures
+        record_answer(lectures, "dissection" if metas and metas[0].get("kind") == "guide" else "chat")
 
     if answered and images and IMAGES_IN_REPLY:
         top = images[0]
@@ -582,13 +723,32 @@ Answer:"""
         credit = top["attribution"] or top["source"]
         reply += f"\n\n![{alt}]({top['url']})\n\n*{credit} ({top['license']})*"
 
-    data = {"reply": reply, "sources": sources, "lectures": lectures, "images": images}
+    data = {
+        "reply": reply, "sources": sources, "lectures": lectures, "images": images,
+        "understood_as": typed if fixes else None,
+    }
     if cacheable and answered:
-        cache_put(request.message, data)
+        cache_put(cache_key, data)
     return ChatResponse(**data)
 
 
 # ---------- Images ----------
+
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    dependencies=[Depends(require_ready), Depends(limit_chat), Depends(daily_chat_cap)],
+)
+def chat(request: ChatRequest, background: BackgroundTasks):
+    t0 = time.time()
+    response = _chat_impl(request, background)
+    background.add_task(
+        chatlog.log_exchange,
+        request.session, request.mode, request.shown or request.message,
+        response.reply, response.lectures, int((time.time() - t0) * 1000),
+    )
+    return response
+
 
 def _clean_title(text: str, fallback: str) -> str:
     title = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
@@ -606,7 +766,9 @@ def conversation_title(req: TitleRequest):
     """Short title for a conversation, from the first question. Never fails: if the model is
     unavailable, the title is the first few words of the question."""
     fallback = req.message.strip()
-    prompt = f"""Write a short title (3 to 6 words) for a student's study chat about human anatomy.
+    prompt = f"""Write a short title (2 to 5 words) naming the specific topic of this student's first message.
+Use the actual structure, region or task (for example "Biceps Brachii Function", "Brachium Quiz", "Anterior Neck Triangle").
+Never use generic titles such as "Human Anatomy Study", "Anatomy Chat" or "Study Session".
 Use title case. No quotes, no ending punctuation, no emoji. Return only the title.
 
 Student's first question: {req.message[:500]}
@@ -618,6 +780,80 @@ Title:"""
     except Exception as e:
         print(f"Title generation failed: {e}")
         return TitleResponse(title=_clean_title("", fallback))
+
+
+@app.post("/translate", response_model=TranslateResponse, dependencies=[Depends(limit_translate)])
+def translate_text(req: TranslateRequest):
+    """Translate an answer the student is already looking at. The English answer stays on screen as the
+    reference, so this is display-only. Anatomical terms stay in English so they match the exam."""
+    language = req.target_language.strip()
+    if language not in TRANSLATE_LANGUAGES:
+        raise HTTPException(status_code=422, detail="Unsupported language.")
+    cache_key = f"[translate:{language}] {req.text}"
+    cached = cache_get(cache_key)
+    if cached and cached.get("translated_text"):
+        return TranslateResponse(translated_text=cached["translated_text"])
+    prompt = f"""Translate the anatomy study answer below into {language}.
+
+Rules:
+- Keep the exact structure: headings, bullet points, numbered lists and bold text stay as they are.
+- Keep every anatomical term in English (or its Latin name), for example "biceps brachii" or "musculocutaneous nerve",
+  because the student's exams are in English. Right after a term you may add its {language} name in brackets,
+  the first time it appears only.
+- Do not translate lecture or file names, numbers, or the markers "General knowledge:" and "Body type note"
+  (translate the words after them).
+- Do not add, remove, correct or explain anything. If a sentence looks wrong, translate it as it is.
+- Return only the translation, with no introduction and no notes.
+
+Answer to translate:
+{req.text}"""
+    try:
+        translated = (generate(prompt) or "").strip()
+    except Exception as e:
+        print(f"Translation failed: {e}")
+        raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+    if not translated:
+        raise HTTPException(status_code=502, detail="The AI service returned an empty translation.")
+    cache_put(cache_key, {"translated_text": translated})
+    return TranslateResponse(translated_text=translated)
+
+
+@app.post("/gloss", response_model=GlossResponse, dependencies=[Depends(limit_gloss)])
+def gloss_term(req: GlossRequest):
+    """A small glossary entry for one term: its name in the student's language plus a plain-English meaning.
+    The lab steps and quizzes stay in English; this only helps a learner understand the word."""
+    language = req.target_language.strip()
+    term = " ".join(req.term.split())
+    if language not in TRANSLATE_LANGUAGES:
+        raise HTTPException(status_code=422, detail="Unsupported language.")
+    cache_key = f"[gloss:{language}] {term.lower()}"
+    cached = cache_get(cache_key)
+    if cached and cached.get("translation"):
+        return GlossResponse(translation=cached["translation"], meaning=cached.get("meaning", ""))
+    prompt = f"""A first-year anatomy student is learning the English term "{term}".
+
+Reply in exactly two lines and nothing else:
+TRANSLATION: the term in {language} (the usual word used for it in {language}; if there is no common word, give a short description in {language})
+MEANING: one short sentence in simple English saying what it is or does (maximum 20 words)
+
+If "{term}" is not an anatomy or dissection term, reply with only: NOT A TERM"""
+    try:
+        raw = (generate(prompt) or "").strip()
+    except Exception as e:
+        print(f"Gloss failed: {e}")
+        raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
+    translation = meaning = ""
+    for line in raw.splitlines():
+        head, _, rest = line.partition(":")
+        key = head.strip().strip("*").upper()
+        if key == "TRANSLATION":
+            translation = rest.strip().strip("*").strip()
+        elif key == "MEANING":
+            meaning = rest.strip().strip("*").strip()
+    if not translation:
+        raise HTTPException(status_code=404, detail="No glossary entry for that term.")
+    cache_put(cache_key, {"translation": translation, "meaning": meaning})
+    return GlossResponse(translation=translation, meaning=meaning)
 
 
 @app.get("/images", dependencies=[Depends(limit_images)])
@@ -757,6 +993,50 @@ def resolve(feedback_id: str, req: ResolveRequest):
     return record
 
 
+# ---------- Instructor review badge and weekly report ----------
+
+@app.get("/admin/chatlog", dependencies=[Depends(require_admin)])
+def admin_chatlog(days: int = 7, q: str = "", mode: str = "", limit: int = 200):
+    """Recent questions and answers, newest first. Filter with q (text) and mode."""
+    return {"records": chatlog.read_log(days, q, mode, limit)}
+
+
+@app.get("/admin/chatlog.csv", dependencies=[Depends(require_admin)])
+def admin_chatlog_csv(days: int = 30, q: str = "", mode: str = ""):
+    return Response(
+        content=chatlog.to_csv(chatlog.read_log(days, q, mode, 2000)),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="askinglis-chatlog.csv"'},
+    )
+
+
+@app.get("/admin/chatlog.xlsx", dependencies=[Depends(require_admin)])
+def admin_chatlog_xlsx(days: int = 90, q: str = "", mode: str = ""):
+    return Response(
+        content=chatlog.to_xlsx(chatlog.read_log(days, q, mode, 20000)),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="askinglis-chatlog.xlsx"'},
+    )
+
+
+@app.get("/reviewed", dependencies=[Depends(limit_images)])
+def reviewed():
+    """Which lectures the instructor has reviewed, and when. Shown as a badge next to the lecture name."""
+    return {"lectures": reviewed_lectures()}
+
+
+@app.get("/admin/report", dependencies=[Depends(require_admin)])
+def admin_report(weeks: int = 4):
+    """What students ask about and miss. Counts only, no student text."""
+    flush_usage()
+    return build_report(weeks)
+
+
+@app.on_event("shutdown")
+def save_usage_on_shutdown():
+    flush_usage()
+
+
 # ---------- Practice questions (Phase 2) ----------
 
 @app.post(
@@ -785,6 +1065,9 @@ def admin_generate_questions(req: QuestionRequest):
 def ingest_note(note: IngestNoteRequest):
     result = ingest_text(note.filename, note.text)
     cache_clear()  # old answers may be based on the previous version of this note
+    if result.get("status") == "ingested":
+        mark_reviewed([note.filename])  # the review tool only sends finalized notes
+        threading.Thread(target=rebuild_vocabulary, daemon=True).start()
     return IngestNoteResponse(**result)
 
 
@@ -815,4 +1098,5 @@ def delete_note(filename: str):
     remove_existing_chunks(safe_name)
     delete_from_github(safe_name)
     cache_clear()
+    threading.Thread(target=rebuild_vocabulary, daemon=True).start()
     return {"status": "deleted", "filename": safe_name}
