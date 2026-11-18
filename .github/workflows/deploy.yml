@@ -1,0 +1,22 @@
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency: deploy
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to droplet
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+          rsync -az --delete --exclude .git --exclude .github --exclude backend/.env --exclude .env.prod ./ deploy@"$HOST":~/ask_inglis_chatbot/
+          ssh deploy@"$HOST" 'cd ~/ask_inglis_chatbot && docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build'
