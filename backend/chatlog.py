@@ -183,6 +183,18 @@ def _purge_repo(cutoff: str):
                 repo.delete_file(item.path, f"Delete chat log older than {RETENTION_DAYS} days", item.sha)
     except Exception as e:
         print(f"Chat log repo purge skipped: {e}")
+    # The weekly Excel files hold the same chats, so they follow the same rule: a week goes once its last day
+    # (Sunday) is older than the cutoff.
+    try:
+        for item in repo.get_contents(f"{REPO_FOLDER}/excel"):
+            m = re.fullmatch(r"week-(\d{4}-\d{2}-\d{2})\.xlsx", item.name)
+            if not m:
+                continue
+            last_day = (datetime.strptime(m.group(1), "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
+            if last_day < cutoff:
+                repo.delete_file(item.path, f"Delete chat Excel older than {RETENTION_DAYS} days", item.sha)
+    except Exception as e:
+        print(f"Chat log Excel purge skipped: {e}")
 
 
 def read_log(days: int = 7, query: str = "", mode: str = "", limit: int = 200) -> list[dict]:

@@ -1,0 +1,26 @@
+# Production on the droplet. Run:  docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+# Needs a file named .env.prod next to this file and backend/.env.
+# The droplet's nginx is the only way in: both ports are bound to localhost.
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - chroma_store:/app/chroma_store
+      - chatlog:/app/chatlog
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_BACKEND_URL: https://${API_HOST}
+    ports:
+      - "127.0.0.1:18080:8080"
+    restart: unless-stopped
+
+volumes:
+  chroma_store:
+  chatlog:

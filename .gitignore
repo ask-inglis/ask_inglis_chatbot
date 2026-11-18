@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.env.prod
 chroma_store/
 .DS_Store
 chatlog/

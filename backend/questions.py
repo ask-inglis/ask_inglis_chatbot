@@ -210,11 +210,25 @@ def _shuffle_options(item: dict) -> dict:
 
 
 STYLE_FILE = os.environ.get("QUIZ_STYLE_FILE", "").strip()
+STYLE_REPO_PATH = os.environ.get("QUIZ_STYLE_REPO_PATH", "").strip()  # style/question_style.md in the private notes repo
+_style_cache = {"text": None, "at": 0.0}
 
 
 def _style_notes() -> str:
-    """Optional short note on how the course director phrases questions, written in our own words.
-    Set QUIZ_STYLE_FILE to its path. Missing or unreadable means no note. Capped so it cannot bloat the prompt."""
+    """Short note on HOW questions are phrased. Read from the private notes repo (cached 1 hour),
+    else from a local file. Missing or unreadable means no note. Capped at 1500 characters."""
+    if STYLE_REPO_PATH:
+        if _style_cache["text"] is not None and time.time() - _style_cache["at"] < 3600:
+            return _style_cache["text"]
+        try:
+            raw = get_github_repo().get_contents(STYLE_REPO_PATH).decoded_content.decode("utf-8")
+            _style_cache.update(text=raw.strip()[:1500], at=time.time())
+            print("STYLE GUIDE LOADED:", len(_style_cache["text"]), "chars")
+            return _style_cache["text"]
+        except Exception as e:
+            print(f"Style guide not loaded: {repr(e)[:120]}")
+            _style_cache.update(text="", at=time.time() - 3300)  # retry in 5 minutes
+            return ""
     if not STYLE_FILE:
         return ""
     try:
@@ -679,8 +693,10 @@ def save_batch(topic: str, items: list[dict]) -> str | None:
         return path
     except Exception as e:
         print(f"Question batch save failed: {e}")
-        return None# ---------- One place that understands every quiz-related message ----------
-import difflib
+        return None
+
+
+# ---------- One place that understands every quiz-related message ----------
 
 _VOCAB = ["answers", "answer", "questions", "question", "options", "option", "choices",
           "quiz", "quizzes", "solutions", "practice", "another", "reveal", "mcqs"]
@@ -725,6 +741,12 @@ def _topic(message: str, prev_text: str) -> str:
     left = [w for w in re.findall(r"[A-Za-z]+", message) if w.lower() not in _FILLER]
     if sum(len(w) for w in left) >= 4:
         return " ".join(left)  # only the subject words: "give me 5 quiz questions with answers on the brachium" -> "brachium"
+    if re.match(r"\s*Score:", prev_text or ""):
+        # The last reply was a graded result, not a quiz. Its feedback text is a bad search topic, so use the
+        # lecture names it lists, e.g. "(Lecture 06 - The Brachium - Notes)" -> "The Brachium".
+        names = [n.replace("_", " ").strip() for n in re.findall(r"Lecture\s*\d+\s*-\s*([^-\n)]+?)\s*-\s*Notes", prev_text)]
+        names = list(dict.fromkeys(n for n in names if n))
+        return " ".join(names)[:200] if names else message
     cleaned = re.sub(r"\*+|Question\s*\d+[.:)]|Answers?:", " ", prev_text).strip()
     return cleaned[:500] if cleaned else message  # same lectures as the quiz just shown
 

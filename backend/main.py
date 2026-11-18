@@ -65,6 +65,7 @@ from cache import cache_get, cache_put, cache_clear
 from typos import build_vocabulary, correct_query
 import chatlog
 from quizgate import quiz_gate, BUSY_REPLY
+from llmbudget import llm_budget, LLMBusy, BUSY_MINUTE_REPLY, BUSY_DAY_REPLY
 from insights import (
     load_insights,
     mark_reviewed,
@@ -172,6 +173,7 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 
 
 def call_openai_style(client, model_name, prompt, max_tokens, label, extra=None):
+    llm_budget.spend()  # raises LLMBusy at the configured request limit
     start = time.time()
     response = client.chat.completions.create(
         model=model_name,
@@ -191,9 +193,12 @@ def call_gemini(prompt: str, first_model: str = "") -> str:
     for model_name in order:
         start = time.time()
         try:
+            llm_budget.spend()  # every attempt counts toward the key's limit
             response = gemini_client.models.generate_content(model=model_name, contents=prompt)
             print(f"Gemini {model_name}: {time.time() - start:.1f}s")
             return (response.text or "").strip()
+        except LLMBusy:
+            raise
         except Exception as e:
             print(f"Gemini {model_name} failed after {time.time() - start:.1f}s: {repr(e)[:120]}")
             last_error = e
@@ -221,6 +226,8 @@ def generate(prompt: str) -> str:
     """The only place the app calls an LLM. Which one is set by LLM_PROVIDER."""
     try:
         return PROVIDERS[LLM_PROVIDER](prompt)
+    except LLMBusy:
+        raise
     except Exception as e:
         print(f"{LLM_PROVIDER} call failed: {e}")
         if LLM_FALLBACK and LLM_PROVIDER != "gemini" and gemini_client is not None:
@@ -490,6 +497,11 @@ def _chat_impl(request: ChatRequest, background: BackgroundTasks):
         intent = quiz_intent(request.message, prev[0].content if prev else "", bool(items) or seen_quiz)
 
         if intent["kind"] == "new":
+            ok, why = llm_budget.quiz_allowed()
+            if not ok:
+                print(f"Quiz refused: AI request limit close ({why})")
+                return ChatResponse(reply=BUSY_DAY_REPLY if why == "day" else BUSY_MINUTE_REPLY,
+                                    sources=[], lectures=[], degraded=True)
             waiting_now = quiz_gate.waiting
             if not quiz_gate.enter():
                 print(f"Quiz busy: {waiting_now} waiting, asked to try again")
@@ -498,9 +510,11 @@ def _chat_impl(request: ChatRequest, background: BackgroundTasks):
                 batch = generate_questions(
                     intent["topic"], intent["count"], generate_quiz,
                     # don't repeat the last quiz, or any question this browser has already shown the student
-                    avoid=list(dict.fromkeys([i["stem"] for i in items] + [str(x)[:300] for x in request.seen])) or None,
+                    avoid=list(dict.fromkeys([i["stem"] for i in (items or [])] + [str(x)[:300] for x in request.seen])) or None,
                 )
             except Exception as e:
+                import traceback
+                traceback.print_exc()  # shows the exact line that failed
                 print(f"Quiz generation failed: {e}")
                 raise HTTPException(status_code=502, detail="The AI service is unavailable right now.")
             finally:
@@ -994,6 +1008,12 @@ def resolve(feedback_id: str, req: ResolveRequest):
 
 
 # ---------- Instructor review badge and weekly report ----------
+
+@app.get("/admin/llm-usage", dependencies=[Depends(require_admin)])
+def admin_llm_usage():
+    """How close the app is to the AI key's limits (set LLM_RPM_LIMIT and LLM_RPD_LIMIT)."""
+    return llm_budget.status()
+
 
 @app.get("/admin/chatlog", dependencies=[Depends(require_admin)])
 def admin_chatlog(days: int = 7, q: str = "", mode: str = "", limit: int = 200):
