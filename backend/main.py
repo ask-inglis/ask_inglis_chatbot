@@ -252,6 +252,24 @@ def require_admin(x_admin_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def require_professor_or_admin(x_admin_key: str = Header(default="")):
+    """Allow full administrators or the restricted Professor integration."""
+    from professor_access import is_professor_integration_key
+
+    if ADMIN_API_KEY and secrets.compare_digest(
+        x_admin_key, ADMIN_API_KEY
+    ):
+        return
+
+    if is_professor_integration_key(
+        x_admin_key,
+        admin_key=ADMIN_API_KEY,
+    ):
+        return
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 # ---------- Startup state ----------
 
 state = {"ready": False}
@@ -952,7 +970,7 @@ def dispute_answer(req: DisputeRequest, background: BackgroundTasks):
     return {"reply": DISPUTE_REPLY, "status": "pending_review"}
 
 
-@app.get("/admin/feedback", dependencies=[Depends(require_admin)])
+@app.get("/admin/feedback", dependencies=[Depends(require_professor_or_admin)])
 def get_feedback(
     rating: str | None = None,
     status: str | None = None,
@@ -963,27 +981,27 @@ def get_feedback(
     return list_feedback(rating=rating, status=status, reason=reason, limit=min(limit, 200))
 
 
-@app.get("/admin/feedback/queue", dependencies=[Depends(require_admin)])
+@app.get("/admin/feedback/queue", dependencies=[Depends(require_professor_or_admin)])
 def feedback_queue(status: str = "pending_review", limit: int = 50):
     """The review queue: thumbs-downs grouped by question, most urgent first."""
     return build_queue(status=status, limit=min(limit, 200))
 
 
-@app.post("/admin/feedback/resolve-group", dependencies=[Depends(require_admin)])
+@app.post("/admin/feedback/resolve-group", dependencies=[Depends(require_professor_or_admin)])
 def resolve_feedback_group(req: ResolveGroupRequest):
     """A human closes every pending thumbs-down about the same question at once."""
     check_decision(req.decision)
     return {"resolved": resolve_group(req.fingerprint, req.decision, req.comment)}
 
 
-@app.post("/admin/feedback/resolve-lecture", dependencies=[Depends(require_admin)])
+@app.post("/admin/feedback/resolve-lecture", dependencies=[Depends(require_professor_or_admin)])
 def resolve_feedback_lecture(req: ResolveLectureRequest):
     """A human closes every pending thumbs-down for one lecture, for example after fixing that note."""
     check_decision(req.decision)
     return {"resolved": resolve_lecture(req.lecture, req.decision, req.comment)}
 
 
-@app.post("/admin/feedback/{feedback_id}/resolve", dependencies=[Depends(require_admin)])
+@app.post("/admin/feedback/{feedback_id}/resolve", dependencies=[Depends(require_professor_or_admin)])
 def resolve(feedback_id: str, req: ResolveRequest):
     """A human closes one thumbs-down."""
     check_decision(req.decision)
@@ -1030,6 +1048,19 @@ def admin_report(weeks: int = 4):
     """What students ask about and miss. Counts only, no student text."""
     flush_usage()
     return build_report(weeks)
+
+
+
+@app.get("/admin/insights", dependencies=[Depends(require_professor_or_admin)])
+def admin_private_insights(weeks: int = 4):
+    """Professor Insights: return only privacy-approved aggregates."""
+    from insights_publication import publish_insights
+    from fastapi import HTTPException
+
+    try:
+        return publish_insights(weeks=weeks)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.on_event("shutdown")
