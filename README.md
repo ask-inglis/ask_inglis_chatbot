@@ -27,6 +27,7 @@ This repository holds the student chatbot: the website (`frontend/`) and the ser
 | `frontend/` | React and Vite website. See `frontend/README.md` |
 | `docker-compose.prod.yml` | How the two containers run on the droplet |
 | `.env.example` | Example backend settings. Copy to `backend/.env` |
+| `locustfile.py` | Load test that simulates many students chatting at once (see Load testing) |
 | `.github/workflows/` | The automatic deploy |
 | `docs/` | Older copy of the site built for GitHub Pages. The droplet does not use it |
 
@@ -66,6 +67,30 @@ npm run dev
 Open http://localhost:5173/ask_inglis_chatbot/ (the address needs that ending). The frontend uses http://localhost:8000 for the backend unless `VITE_BACKEND_URL` says otherwise.
 
 To run the chatbot and the professor portal together, give them different ports. See the portal README.
+
+## Load testing
+
+`locustfile.py` simulates students using the chat continuously: asking questions, asking for quizzes, and using the guided mode. It shows how the backend behaves with many students at once.
+
+**Run it against a backend on your own computer, not the live site.** Every simulated question calls Gemini, so a test against the live site uses up the real daily quota and fills the real chat log.
+
+1. Start the backend on your computer with a throwaway log folder, so test questions stay out of the real log. In `backend/.env` set:
+   ```
+   CHATLOG_DIR=loadtest_log
+   CHATLOG_REPO_FOLDER=chatlog-loadtest
+   ```
+   Leave the rate limits at their real values. Each simulated student gets its own fake address, so the limits behave as they would for real students.
+2. Install Locust and run 20 students for 5 minutes:
+   ```bash
+   pip install locust
+   locust -f locustfile.py --headless -u 20 -r 2 -t 5m --host http://localhost:8000 --csv results
+   ```
+   `-u` is the number of students, `-r` is how many start per second, and `-t` is how long it runs. For a browser dashboard, leave out `--headless` and open http://localhost:8089.
+3. Read the results in the terminal or in the `results_*.csv` files. Look at the failure count and the response times for `/chat`.
+
+Optional settings (environment variables): `FAKE_IPS=0` makes all students share one address, to test one address hammering the server. `UNIQUE=0` lets the answer cache hide the real cost of each question. `THINK_MIN` and `THINK_MAX` set how many seconds a student pauses between actions (default 5 and 20). `ADMIN_KEY` adds an admin user who reads the chat log now and then.
+
+Test traffic is saved in `chatlog-loadtest/` in the private notes repo, apart from the real log.
 
 ## Deploying
 
