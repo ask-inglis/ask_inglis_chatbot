@@ -36,6 +36,8 @@ it can be deleted safely.
 | `guides.py` | Reads the NBME item-writing guide from the private repo |
 | `protect.py` | Allowed websites (CORS), rate limits, daily cap |
 | `cache.py` | Remembers answers to repeated first questions for 6 hours |
+| `chatlog.py` | Keeps the instructor's log of questions and answers (no names or IP addresses) and copies it to the private notes repo |
+| `quizgate.py` | Limits how many practice quizzes are written at the same moment, and makes the rest wait |
 | `images.py` | Approved-image catalog. Phase 3 images are **not enabled yet** |
 | `phase1_backend.py` | End-to-end check of Phase 1 |
 
@@ -43,7 +45,7 @@ it can be deleted safely.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then fill in the values below
+cp ../.env.example .env     # then fill in the values below
 uvicorn main:app
 ```
 Wait for `Warm-up finished`. `GET /` shows `"ready": true` when it can answer. Until then, `/chat` returns `503`.
@@ -57,7 +59,7 @@ python3 phase1_backend.py
 ## Settings (`.env`)
 | Setting | What it is |
 |---|---|
-| `LLM_PROVIDER` | `gemini` (public site), `bullsai` (UB network only) or `custom` (any OpenAI-compatible service) |
+| `LLM_PROVIDER` | `gemini` (public site) or `bullsai` (UB network only) |
 | `LLM_FALLBACK` | If a non-Gemini provider fails, fall back to Gemini (default `true`) |
 | `GEMINI_API_KEY` | Key for Google's Gemini API |
 | `GEMINI_MODEL_NAME`, `GEMINI_FALLBACK_MODELS` | Main model, and models tried in order if it is overloaded or retired |
@@ -65,14 +67,13 @@ python3 phase1_backend.py
 | `GEMINI_QUIZ_MODEL` | Optional. A stronger model tried first for practice questions only |
 | `BULLSAI_API_KEY`, `BULLSAI_BASE_URL`, `BULLSAI_MODEL_NAME` | BullsAI settings. Reachable only from UB's network |
 | `BULLSAI_TIMEOUT`, `BULLSAI_MAX_TOKENS` | Keep max tokens high (8000+): gpt-oss models spend tokens thinking, and a low cap gives empty quizzes |
-| `CUSTOM_LLM_*` | Base URL, key, model name, timeout and max tokens for a custom provider (unused now) |
 | `GITHUB_NOTES_REPO` | `owner/repo` of the private notes repo |
 | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (or `GITHUB_APP_PRIVATE_KEY_FILE`) | The GitHub App (`ask-inglis-bot`) that reads and writes the notes repo |
 | `GITHUB_APP_INSTALLATION_ID` | Optional. Looked up automatically if blank |
 | `GITHUB_BOT_NAME`, `GITHUB_BOT_EMAIL` | The bot's name and `ID+name@users.noreply.github.com` address, used on resolution commits |
 | `ADMIN_API_KEY` | Secret that the `X-Admin-Key` header must match on `/admin` routes |
 | `ALLOWED_ORIGINS` | Websites allowed to call the API, comma-separated |
-| `TRUSTED_PROXY_HOPS` | Number of proxies in front of the server (Render uses 1) |
+| `TRUSTED_PROXY_HOPS` | Number of proxies in front of the server. On the droplet it is 1 (the droplet's nginx; the nginx container passes the address through unchanged) |
 | `CHAT_PER_MIN`, `DISPUTE_PER_MIN`, `FEEDBACK_PER_MIN`, `IMAGES_PER_MIN`, `TITLE_PER_MIN` | Rate limits per address per minute (0 turns one off) |
 | `DAILY_CHAT_LIMIT` | Questions per day across everyone (0 = off) |
 | `CACHE_TTL_SECONDS`, `CACHE_MAX_ENTRIES` | How long and how many repeated answers are remembered |
@@ -84,6 +85,16 @@ python3 phase1_backend.py
 | `QUESTION_OPTIONS` | Options per practice question (default 5) |
 | `QUIZ_PARALLEL_CALLS` | Model calls run at the same time when writing a quiz (default 3). Lower it if Gemini returns 429 |
 | `GUIDE_NAME_PATTERN` | File-name pattern that marks a note as a dissection guide (default `\bClass\s+\d+`) |
+| `QUIZ_MAX_CONCURRENT`, `QUIZ_MAX_WAITING`, `QUIZ_WAIT_SECONDS` | How many quizzes are written at once (default 6), how many students may wait in line (default 14), and how long a student waits before being asked to try again (default 150 seconds) |
+| `QUIZ_MAX_ROUNDS`, `QUIZ_SPARES`, `QUIZ_SHORT_OK` | Rounds of writing and checking before giving up (default 3), extra questions written per round (default 2), and how many questions short a quiz may be delivered (default 0) |
+| `QUIZ_STYLE_REPO_PATH`, `QUIZ_REASONING_EFFORT` | Optional path of the question-style note in the notes repo (for example `style/question_style.md`), and (BullsAI only) `low`, `medium` or `high` thinking effort |
+| `TRANSLATE_PER_MIN`, `GLOSS_PER_MIN` | Rate limits for translating answers (default 20) and glossary entries (default 40) |
+| `LLM_RPM_LIMIT`, `LLM_RPD_LIMIT` | Model calls per minute and per day shared by everyone, kept under Gemini's free-tier limits. We use 9 and 450 |
+| `LLM_QUIZ_CALLS_NEEDED` | Model calls one practice quiz needs (we use 6) |
+| `PROFESSOR_INTEGRATION_KEY` | Secret used for the professor portal's connection to this backend |
+| `CHATLOG_ENABLED`, `CHATLOG_DIR` | Turn the question log on or off (default on), and where the working copy is kept (default `chatlog`) |
+| `CHATLOG_RETENTION_DAYS` | Days before old log files are deleted, here and in the notes repo (default 90) |
+| `CHATLOG_REPO_SYNC`, `CHATLOG_SYNC_SECONDS`, `CHATLOG_REPO_FOLDER`, `CHATLOG_XLSX_SECONDS` | Copying the log into the notes repo (default on, every 600 seconds, folder `chatlog`) and how often the weekly Excel summary is made (default 3600) |
 
 ## API
 **Public**
@@ -93,12 +104,17 @@ python3 phase1_backend.py
   title is the first words of the question
 - `POST /feedback`: `{question, answer, rating: "up"|"down", comment, lectures}`
 - `POST /feedback/dispute`: a student says an answer is wrong; the backend checks it against the notes
+- `POST /translate`: `{text, target_language}` returns the answer in another language. Display only; anatomical terms stay in English
+- `POST /gloss`: `{term, target_language}` returns a short glossary entry for one term
+- `GET /reviewed`: which lectures the instructor has reviewed, and when
 - `GET /images`, `GET /guide-image/{id}`: approved images
 
 **Admin** (header `X-Admin-Key`, call from a server, never from browser code)
 - `POST /admin/ingest-note`: `{filename, text}`, where `filename` is the note's name without an extension
 - `GET /admin/notes`, `GET /admin/notes/{filename}`, `DELETE /admin/notes/{filename}`
 - `GET /admin/feedback`, `GET /admin/feedback/queue`: thumbs-downs, grouped by question in the queue
+- `GET /admin/chatlog` (also `.csv` and `.xlsx`): recent questions and answers, newest first
+- `GET /admin/report`: what students ask about and miss (counts only, no student text)
 - `POST /admin/feedback/{id}/resolve`: `{decision, comment}`
 - `POST /admin/feedback/resolve-group`: `{fingerprint, decision, comment}`
 - `POST /admin/feedback/resolve-lecture`: close every pending item for one lecture
@@ -116,6 +132,15 @@ python3 phase1_backend.py
   "give me 5 quiz questions with answers on the brachium", then "show the answers" or answer the questions to be graded.
 - **Rebuild the index:** delete `chroma_store/` and restart.
 
+## Running on the droplet
+The backend runs as a Docker container on the droplet and is deployed when `main` is pushed (see the repo's main README). Settings are in `backend/.env` on the droplet. After changing it, restart the container:
+```bash
+docker ps --format '{{.Names}}' | grep -i backend     # the portal has a backend too; pick the chatbot's
+docker restart NAME_HERE
+docker logs -f --tail 20 NAME_HERE                    # wait for "Warm-up finished"
+```
+The notes folder and the chat log are copied to the private notes repo, so they survive a restart or a rebuild.
+
 ## Credentials and who owns them
 | Credential | Where it lives | Notes |
 |---|---|---|
@@ -127,7 +152,8 @@ python3 phase1_backend.py
 Never put any of these in the frontend or in a public repository. The old personal GitHub token is no longer used.
 
 ## Known limits
-- Free-tier hosting sleeps when idle, so the first visit after a quiet period waits for the warm-up.
+- After a restart the backend needs a short warm-up while it rebuilds the search index. `/chat` returns 503 until it finishes.
+- The question log holds real student questions (no names, no IP addresses; emails and long digit strings are masked). It is stored in the private notes repo and deleted after `CHATLOG_RETENTION_DAYS`. UB approval for storing student questions is still to be confirmed.
 - Gemini's free tier can be overloaded (503) or rate-limited (429). The server tries the fallback models, then shows the most
   relevant note passages instead of an answer.
 - A practice quiz takes 1 to 2 minutes on the free tier. A question the checker cannot read is dropped and replaced, so a quiz may
