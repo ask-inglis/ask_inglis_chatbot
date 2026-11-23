@@ -218,3 +218,59 @@ def build_report(weeks: int = 4) -> dict:
         )[:15],
         "reviewed_lectures": reviewed_lectures(),
     }
+
+# ---------- Internal learning analytics ----------
+
+def prepare_internal_learning_insights(weeks: int = 4) -> dict:
+    """Prepare real interaction statistics for internal processing only.
+
+    These counts do not establish distinct student contributors.
+    They must never be returned directly by Professor Insights.
+    """
+    import copy
+    from datetime import datetime, timezone
+
+    from insights_aggregates import prepare_weekly_aggregates
+
+    with _lock:
+        snapshot = copy.deepcopy(_usage)
+
+    result = prepare_weekly_aggregates(
+        snapshot,
+        weeks=weeks,
+        today=datetime.now(timezone.utc).date(),
+    )
+
+    # Never treat interaction counts as verified student counts.
+    result["privacy_approved"] = False
+    result["source"] = "internal_student_activity"
+
+    return result
+
+
+def prepare_internal_validated_insights(
+    weeks: int = 4,
+    today=None,
+) -> dict:
+    """Process actual activity using the validated reporting pipeline.
+
+    The resulting report is internal-only and must not be returned
+    directly through the Professor Insights API.
+    """
+    import copy
+
+    from insights_validated_pipeline import prepare_validated_report
+
+    with _lock:
+        snapshot = copy.deepcopy(_usage)
+
+    result = prepare_validated_report(
+        snapshot,
+        weeks=weeks,
+        today=today,
+    )
+
+    result["status"] = "candidate_only"
+    result["privacy_approved"] = False
+
+    return result
